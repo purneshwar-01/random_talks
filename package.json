@@ -1,0 +1,40 @@
+{
+  "name": "random_talks",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@studio-freight/lenis": "^1.0.42",
+    "@zegocloud/zego-uikit-prebuilt": "^2.18.0",
+    "canvas-confetti": "^1.9.4",
+    "firebase": "^10.14.1",
+    "framer-motion": "^14.4.0",
+    "lucide-react": "^0.344.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.30.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.0",
+    "@types/canvas-confetti": "^1.9.0",
+    "@types/react": "^18.2.56",
+    "@types/react-dom": "^18.2.19",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.5.4",
+    "eslint": "^9.9.0",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.9",
+    "globals": "^15.9.0",
+    "playwright": "^1.63.0",
+    "postcss": "^8.5.23",
+    "tailwindcss": "^3.4.19",
+    "vite": "^5.1.4"
+  }
+}

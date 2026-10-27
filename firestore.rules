@@ -1,0 +1,126 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper Functions ───────────────────────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    // ── 1. Users Collection ────────────────────────────────────────────────────
+    // Read: Authenticated users can view public profile details.
+    // Create: Owner only, cannot self-assign isBanned or strikeCount.
+    // Update: Owner only; client CANNOT modify security-critical isBanned or strikeCount.
+    match /users/{uid} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(uid)
+                    && (!('isBanned' in request.resource.data) || request.resource.data.isBanned == false)
+                    && (!('strikeCount' in request.resource.data) || request.resource.data.strikeCount == 0);
+      allow update: if isOwner(uid)
+                    && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['isBanned', 'strikeCount']));
+      allow delete: if false;
+    }
+
+    // ── 2. Matchmaking Queue ───────────────────────────────────────────────────
+    // Enforces single-user queue entry isolation.
+    match /matchQueue/{uid} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // ── 3. Calls Collection & Subcollections ───────────────────────────────────
+    // Signaling room isolation: only the 2 matched participants may read, write, or query.
+    match /calls/{roomId} {
+      allow create: if isAuthenticated() && request.auth.uid in request.resource.data.participants;
+      allow read, update: if isAuthenticated() && request.auth.uid in resource.data.participants;
+      allow delete: if false;
+
+      // In-call ephemeral messages subcollection
+      match /messages/{messageId} {
+        allow read, create: if isAuthenticated()
+          && request.auth.uid in get(/databases/$(database)/documents/calls/$(roomId)).data.participants;
+        allow update, delete: if false;
+      }
+
+      // Ephemeral ICE candidates or signaling subcollections
+      match /{subcollection}/{docId} {
+        allow read, write: if isAuthenticated()
+          && request.auth.uid in get(/databases/$(database)/documents/calls/$(roomId)).data.participants;
+      }
+    }
+
+    // ── 4. Call History ────────────────────────────────────────────────────────
+    // Strictly private to the individual account owner.
+    match /call_history/{recordId} {
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow read, update, delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // ── 5. Direct Messages (DMs) ───────────────────────────────────────────────
+    // Scoped strictly to the 2 confirmed friendship participants.
+    match /dms/{dmId} {
+      allow create: if isAuthenticated() && request.auth.uid in request.resource.data.participants;
+      allow read, update: if isAuthenticated() && request.auth.uid in resource.data.participants;
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read, create: if isAuthenticated()
+          && request.auth.uid in get(/databases/$(database)/documents/dms/$(dmId)).data.participants;
+        allow update, delete: if false;
+      }
+    }
+
+    // ── 6. Reports Ledger ──────────────────────────────────────────────────────
+    // Create-only by verified reporter; client cannot inspect or alter submitted reports.
+    match /reports/{reportId} {
+      allow create: if isAuthenticated() && request.auth.uid == request.resource.data.reporterUid;
+      allow read, update, delete: if false;
+    }
+
+    // ── 7. Bidirectional Blocks ────────────────────────────────────────────────
+    // Initiating user manages blocks; either party can read their block relation.
+    match /blocks/{blockId} {
+      allow create: if isAuthenticated() && request.resource.data.blockerUid == request.auth.uid;
+      allow read, delete: if isAuthenticated() && (resource.data.blockerUid == request.auth.uid || resource.data.blockedUid == request.auth.uid);
+      allow update: if false;
+    }
+
+    // ── 8. Friends & Friend Requests ───────────────────────────────────────────
+    match /friends/{friendshipId} {
+      allow read: if isAuthenticated() && request.auth.uid in resource.data.users;
+      allow create: if isAuthenticated() && request.auth.uid in request.resource.data.users;
+      allow update, delete: if isAuthenticated() && request.auth.uid in resource.data.users;
+    }
+
+    match /friendRequests/{requestId} {
+      allow create: if isAuthenticated() && request.resource.data.fromUid == request.auth.uid;
+      allow read: if isAuthenticated() && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
+      allow update, delete: if isAuthenticated() && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
+    }
+
+    // ── 9. Direct Call Invites ─────────────────────────────────────────────────
+    match /callInvites/{receiverUid} {
+      allow create: if isAuthenticated() && request.resource.data.callerUid == request.auth.uid;
+      allow read, update, delete: if isAuthenticated() && (
+        resource.data.callerUid == request.auth.uid || resource.data.receiverUid == request.auth.uid
+      );
+    }
+
+    // ── 10. Private Code Rooms & Network Exchanges ─────────────────────────────
+    match /privateRooms/{code} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /networkExchanges/{roomId}/intents/{uid} {
+      allow read, write: if isAuthenticated() && request.auth.uid == uid;
+    }
+
+    match /feedback/{feedbackId} {
+      allow create: if isAuthenticated() && request.resource.data.fromUid == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+  }
+}
