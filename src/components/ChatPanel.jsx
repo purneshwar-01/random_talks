@@ -74,7 +74,7 @@ export default function ChatPanel({ roomId, uid, username, onClose }) {
   };
 
   return (
-    <div className="absolute right-5 top-20 bottom-24 w-80 bg-white border border-slate-200 rounded-2xl flex flex-col overflow-hidden z-20 pointer-events-auto shadow-xl font-sans text-slate-900">
+    <div className="fixed sm:absolute right-4 sm:right-5 top-16 sm:top-20 bottom-24 w-[calc(100vw-2rem)] sm:w-80 bg-white border border-slate-200 rounded-2xl flex flex-col overflow-hidden z-50 pointer-events-auto shadow-2xl font-sans text-slate-900">
       <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-slate-50">
         <span className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
           <Lock size={13} className="text-[#FCA311]" /> Private Chat

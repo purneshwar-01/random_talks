@@ -22,6 +22,26 @@ function queueRef(uid) {
 }
 
 // ---------------------------------------------------------------------------
+// generateOpaqueRoomToken — generates a secure opaque token: rt-xxxx-xxxx
+// Eliminates raw Firebase Auth UID exposure in browser URLs and signaling.
+// ---------------------------------------------------------------------------
+export function generateOpaqueRoomToken() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let seg1 = '';
+  let seg2 = '';
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    for (let i = 0; i < 4; i++) seg1 += chars[bytes[i] % chars.length];
+    for (let i = 4; i < 8; i++) seg2 += chars[bytes[i] % chars.length];
+  } else {
+    for (let i = 0; i < 4; i++) seg1 += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 4; i < 8; i++) seg2 += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return `rt-${seg1}-${seg2}`;
+}
+
+// ---------------------------------------------------------------------------
 // joinQueue — writes the caller into the public waiting pool.
 // Resets status: 'waiting', clears stale roomId and matchedWith.
 // ---------------------------------------------------------------------------
@@ -55,7 +75,8 @@ export async function leaveQueue(uid) {
 // ensureCallRoom — idempotently creates a /calls/{roomId} document.
 // ---------------------------------------------------------------------------
 export async function ensureCallRoom(roomId, participants, extraFields = {}) {
-  const ref = doc(db, CALLS, roomId);
+  const safeRoomId = roomId || generateOpaqueRoomToken();
+  const ref = doc(db, CALLS, safeRoomId);
   const snap = await getDoc(ref);
   if (!snap.exists()) {
     await setDoc(ref, {
@@ -66,6 +87,7 @@ export async function ensureCallRoom(roomId, participants, extraFields = {}) {
       ...extraFields,
     });
   }
+  return safeRoomId;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,11 +140,11 @@ export async function tryMatch(uid, { gender, genderFilter, mode, searchAttemptC
   const myMode = mode || 'casual';
 
   try {
-    // Single-field query (no composite index needed)
+    // Single-field query with limited size to optimize Firestore read quotas
     const q = query(
       collection(db, QUEUE),
       where('status', '==', 'waiting'),
-      limit(80)
+      limit(20)
     );
     const snap = await getDocs(q);
 
@@ -210,7 +232,7 @@ export async function tryMatch(uid, { gender, genderFilter, mode, searchAttemptC
 // attemptLock — atomic room pairing and status commitment with runTransaction
 // ---------------------------------------------------------------------------
 async function attemptLock(myUid, otherUid) {
-  const roomId = [myUid, otherUid].sort().join('_') + '_' + Date.now();
+  const roomId = generateOpaqueRoomToken();
   const meRef    = queueRef(myUid);
   const otherRef = queueRef(otherUid);
   const callRef  = doc(db, CALLS, roomId);
@@ -287,7 +309,7 @@ export function listenForMatch(uid, onMatched, onError, onQueueActivity) {
     const q = query(
       collection(db, QUEUE),
       where('status', '==', 'waiting'),
-      limit(80)
+      limit(20)
     );
     unsubQueue = onSnapshot(
       q,
@@ -313,7 +335,7 @@ export function listenForMatch(uid, onMatched, onError, onQueueActivity) {
 // listenToWaitingQueue — informational real-time snapshot.
 // ---------------------------------------------------------------------------
 export function listenToWaitingQueue(onUpdate) {
-  const q = query(collection(db, QUEUE), where('status', '==', 'waiting'), limit(80));
+  const q = query(collection(db, QUEUE), where('status', '==', 'waiting'), limit(20));
   return onSnapshot(
     q,
     (snap) => { onUpdate(snap.docs.map((d) => d.data())); },

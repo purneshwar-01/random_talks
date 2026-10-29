@@ -26,16 +26,41 @@ service cloud.firestore {
     }
 
     // ── 2. Matchmaking Queue ───────────────────────────────────────────────────
-    // Enforces single-user queue entry isolation.
+    // Enforces queue entry integrity and allows atomic transaction pairing.
     match /matchQueue/{uid} {
-      allow read, write: if isOwner(uid);
+      allow read: if isAuthenticated();
+      allow create, delete: if isOwner(uid);
+      allow update: if isOwner(uid) || (
+        isAuthenticated() &&
+        resource.data.status == 'waiting' &&
+        request.resource.data.status == 'matched' &&
+        request.resource.data.matchedWith == request.auth.uid &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['uid', 'joinedAt', 'username'])
+      );
     }
 
     // ── 3. Calls Collection & Subcollections ───────────────────────────────────
-    // Signaling room isolation: only the 2 matched participants may read, write, or query.
+    // Signaling room isolation: participants and authorized invitees (up to 5 peers).
     match /calls/{roomId} {
       allow create: if isAuthenticated() && request.auth.uid in request.resource.data.participants;
-      allow read, update: if isAuthenticated() && request.auth.uid in resource.data.participants;
+      allow read: if isAuthenticated() && (
+        request.auth.uid in resource.data.participants ||
+        (resource.data.isEnded == false && resource.data.status == 'active' && resource.data.participants.size() < 5)
+      );
+      allow update: if isAuthenticated() && (
+        // Existing participant update
+        (request.auth.uid in resource.data.participants) ||
+        // Incoming invited peer joining the room
+        (
+          resource.data.isEnded == false &&
+          resource.data.status == 'active' &&
+          resource.data.participants.size() < 5 &&
+          request.resource.data.participants.hasAll(resource.data.participants) &&
+          request.resource.data.participants.hasAll([request.auth.uid]) &&
+          request.resource.data.participants.size() == resource.data.participants.size() + 1 &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['isEnded', 'createdAt'])
+        )
+      );
       allow delete: if false;
 
       // In-call ephemeral messages subcollection
@@ -49,6 +74,11 @@ service cloud.firestore {
       match /{subcollection}/{docId} {
         allow read, write: if isAuthenticated()
           && request.auth.uid in get(/databases/$(database)/documents/calls/$(roomId)).data.participants;
+
+        match /{nestedSubcollection}/{nestedDocId} {
+          allow read, write: if isAuthenticated()
+            && request.auth.uid in get(/databases/$(database)/documents/calls/$(roomId)).data.participants;
+        }
       }
     }
 

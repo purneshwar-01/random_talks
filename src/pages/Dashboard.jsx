@@ -33,6 +33,7 @@ import {
   tryMatch,
   listenForMatch,
   ensureCallRoom,
+  generateOpaqueRoomToken,
 } from '../lib/matchmaking';
 import { checkIsBanned } from '../lib/moderation';
 import SoloTestModal from '../components/SoloTestModal';
@@ -222,6 +223,7 @@ export default function Dashboard() {
   const [unreadCounts, setUnreadCounts] = useState({});
 
   const pollRef = useRef(null);
+  const debounceTimeoutRef = useRef(null);
   const unsubRef = useRef(null);
   const queueUnsubRef = useRef(null);
   const declineUnsubRef = useRef(null);
@@ -287,11 +289,20 @@ export default function Dashboard() {
     return unsub;
   }, [user?.uid]);
 
-  // ── Cleanup on unmount ──────────────────────────────────────────────────
+  // ── Cleanup on unmount & Back-Button (popstate) trapping during search ────
   useEffect(() => {
-    return () => { stopSearching(true); };
+    const handlePopState = () => {
+      if (searching) {
+        stopSearching(true);
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      stopSearching(true);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [searching]);
 
   // ── Matchmaking helpers ─────────────────────────────────────────────────
   const stopSearching = (removeFromQueue = true) => {
@@ -299,10 +310,11 @@ export default function Dashboard() {
     setSearchStatusText('');
     searchAttemptsRef.current = 0;
     if (pollRef.current) clearInterval(pollRef.current);
+    if (debounceTimeoutRef.current) clearTimeout(debounceTimeoutRef.current);
     if (unsubRef.current) unsubRef.current();
     if (queueUnsubRef.current) queueUnsubRef.current();
     if (declineUnsubRef.current) { declineUnsubRef.current(); declineUnsubRef.current = null; }
-    pollRef.current = null; unsubRef.current = null; queueUnsubRef.current = null;
+    pollRef.current = null; debounceTimeoutRef.current = null; unsubRef.current = null; queueUnsubRef.current = null;
     if (removeFromQueue && user) leaveQueue(user.uid).catch(() => { });
   };
 
@@ -311,7 +323,7 @@ export default function Dashboard() {
     navigatedRef.current = true;
     stopSearching(false);
     const roleQuery = role ? `&role=${role}` : '';
-    navigate(`/call/${roomId}?mode=${matchMode}${roleQuery}`);
+    navigate(`/call/${roomId}?mode=${matchMode}${roleQuery}`, { replace: true });
   };
 
   const startMatch = async () => {
@@ -335,7 +347,20 @@ export default function Dashboard() {
         occupation: profile.occupation || '',
         age: profile.age,
       });
+
+      let lastAttemptTime = 0;
       const attempt = async () => {
+        const now = Date.now();
+        if (now - lastAttemptTime < 2500) {
+          if (!debounceTimeoutRef.current) {
+            debounceTimeoutRef.current = setTimeout(() => {
+              debounceTimeoutRef.current = null;
+              attempt();
+            }, 2500 - (now - lastAttemptTime));
+          }
+          return;
+        }
+        lastAttemptTime = now;
         searchAttemptsRef.current += 1;
         const attempts = searchAttemptsRef.current;
         if (attempts <= 4) setSearchStatusText(`Looking for a ${activeModeObj.label} partner...`);
@@ -372,7 +397,8 @@ export default function Dashboard() {
       );
 
       await attempt();
-      pollRef.current = setInterval(attempt, 1500);
+      // Watchdog fallback polling at 10s protects Firestore read quota from aggressive polling
+      pollRef.current = setInterval(attempt, 10000);
     } catch (err) {
       console.error('Start match error:', err);
       setErrorMessage('Failed to start matchmaking. Please try again.');
@@ -381,13 +407,13 @@ export default function Dashboard() {
   };
 
   const startPracticeCall = async () => {
-    const roomId = `practice_${user.uid}_${Date.now()}`;
+    const roomId = `practice_${generateOpaqueRoomToken()}`;
     try {
       await ensureCallRoom(roomId, [user.uid], { isPractice: true, createdBy: user.uid });
     } catch (err) {
       console.error('Solo test room error:', err);
     }
-    navigate(`/call/${roomId}?mode=practice`);
+    navigate(`/call/${roomId}?mode=practice`, { replace: true });
   };
 
   const startDirectCall = async (friend) => {
@@ -416,7 +442,7 @@ export default function Dashboard() {
       } else if (status === 'gone') {
         if (declineUnsubRef.current) { declineUnsubRef.current(); declineUnsubRef.current = null; }
         setCallingFriend(null);
-        navigate(`/call/${roomId}?mode=direct`);
+        navigate(`/call/${roomId}?mode=direct`, { replace: true });
       }
     });
   };

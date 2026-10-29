@@ -11,6 +11,7 @@ import {
   collection,
   addDoc,
   serverTimestamp,
+  arrayUnion,
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
 import {
@@ -40,6 +41,10 @@ import {
   Link2,
   Rocket,
   Users,
+  MoreHorizontal,
+  Volume2,
+  VolumeX,
+  UserPlus,
 } from 'lucide-react';
 import {
   leaveQueue,
@@ -48,10 +53,12 @@ import {
   listenForMatch,
   markCallEnded,
   listenForCallEnd,
+  ensureCallRoom,
 } from '../lib/matchmaking';
 import { blockUser, reportUser } from '../lib/moderation';
 import { saveCallRecord, updateCallNotesByRoom } from '../lib/callHistory';
-import { generateIcebreaker } from '../lib/geminiIcebreaker';
+import { generateIcebreaker } from '../lib/gemini';
+import { checkIsFriend, checkPendingRequest, sendFriendRequest } from '../lib/friends';
 import ChatPanel from '../components/ChatPanel';
 import ReportModal from '../components/ReportModal';
 import FeedbackModal from '../components/FeedbackModal';
@@ -126,7 +133,7 @@ class CallRoomErrorBoundary extends Component {
   }
 }
 
-// Helper to extract the other peer's UID from roomId: uidA_uidB_timestamp
+// Helper to extract the other peer's UID from roomId or participant array
 function parseOtherUid(roomId, myUid, fallbackParticipants = []) {
   if (!roomId) return null;
   if (roomId.startsWith('practice_') || roomId.startsWith('solo_')) {
@@ -136,13 +143,16 @@ function parseOtherUid(roomId, myUid, fallbackParticipants = []) {
     const found = fallbackParticipants.find((id) => id && id !== myUid);
     if (found) return found;
   }
-  const parts = roomId.split('_');
-  if (parts.length >= 2) {
-    const candidateA = parts[0];
-    const candidateB = parts[1];
-    if (candidateA && candidateA !== myUid && !candidateA.startsWith('private')) return candidateA;
-    if (candidateB && candidateB !== myUid && !candidateB.startsWith('private')) return candidateB;
-    if (candidateA === myUid && candidateB === myUid) return myUid;
+  // Fallback for legacy rooms formatted as uidA_uidB_timestamp
+  if (!roomId.startsWith('rt-') && !roomId.startsWith('private_')) {
+    const parts = roomId.split('_');
+    if (parts.length >= 2) {
+      const candidateA = parts[0];
+      const candidateB = parts[1];
+      if (candidateA && candidateA !== myUid) return candidateA;
+      if (candidateB && candidateB !== myUid) return candidateB;
+      if (candidateA === myUid && candidateB === myUid) return myUid;
+    }
   }
   return null;
 }
@@ -153,11 +163,15 @@ function CallRoomInner() {
   const mode = (searchParams?.get('mode') || 'casual').toLowerCase();
 
   const safeRoomId = initialRoomId || 'practice_room';
+  const [roomParticipants, setRoomParticipants] = useState([]);
+  const [participantProfiles, setParticipantProfiles] = useState({});
+
   const isSoloTest = Boolean(
-    safeRoomId.startsWith('practice_') ||
-    safeRoomId.startsWith('solo_') ||
-    mode === 'practice' ||
-    mode === 'solo'
+    (safeRoomId.startsWith('practice_') ||
+      safeRoomId.startsWith('solo_') ||
+      mode === 'practice' ||
+      mode === 'solo') &&
+      roomParticipants.length <= 1
   );
   const isPrivateRoom = Boolean(
     safeRoomId.startsWith('private_') ||
@@ -186,28 +200,37 @@ function CallRoomInner() {
 
   // Video and Media Stream Refs & State (state ensures React re-renders when tracks attach)
   const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
   const screenVideoRef = useRef(null);
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
-  const remoteStreamRef = useRef(null);
-  const pcRef = useRef(null);
+
+  // Multi-Peer Mesh WebRTC State & Refs (up to 5 participants)
+  const pcsRef = useRef({}); // { [peerUid]: RTCPeerConnection }
+  const remoteStreamsRef = useRef({}); // { [peerUid]: MediaStream }
+  const audioContextsRef = useRef({}); // { [peerUid]: { ctx, analyser, animId } }
+  const meshUnsubsRef = useRef({}); // { [peerUid]: Function[] }
+  const subtitleTimerRef = useRef(null);
   const recognitionRef = useRef(null);
   const disconnectTimeoutRef = useRef(null);
-
-  const [roomParticipants, setRoomParticipants] = useState([]);
-  const [participantProfiles, setParticipantProfiles] = useState({});
+  const pcRef = useRef(null); // legacy single-peer reference for fallback
 
   const [localStreamState, setLocalStreamState] = useState(null);
-  const [remoteStreamState, setRemoteStreamState] = useState(null);
+  const [remoteStreams, setRemoteStreams] = useState({}); // { [peerUid]: MediaStream }
 
   // Audio Level Analyzers
   const [micVolume, setMicVolume] = useState(0); // 0-100
-  const [remoteVolume, setRemoteVolume] = useState(0); // 0-100
+  const [remoteVolumes, setRemoteVolumes] = useState({}); // { [peerUid]: number }
+
+  // Per-peer context menu, volume override (0-200%), and mute state
+  const [userVolumeOverrides, setUserVolumeOverrides] = useState({}); // { [peerUid]: number }
+  const [userMutedForMe, setUserMutedForMe] = useState({}); // { [peerUid]: boolean }
+  const [cardMenuOpenUid, setCardMenuOpenUid] = useState(null);
+  const [friendStatuses, setFriendStatuses] = useState({}); // { [peerUid]: 'none' | 'friends' | 'pending' }
 
   // Matchmaking / binge auto-next state
   const [isSearchingNext, setIsSearchingNext] = useState(false);
   const matchPollRef = useRef(null);
+  const matchDebounceTimeoutRef = useRef(null);
   const matchUnsubRef = useRef(null);
   const queueUnsubRef = useRef(null);
   const searchAttemptsRef = useRef(0);
@@ -224,6 +247,7 @@ function CallRoomInner() {
   const notesRef = useRef('');
   const hasSavedCallRef = useRef(false);
   const isExplicitlyLeavingRef = useRef(false);
+  const hasAttemptedJoinRef = useRef({});
 
   // UI state
   const [icebreaker, setIcebreaker] = useState('');
@@ -262,29 +286,36 @@ function CallRoomInner() {
   const [notes, setNotes] = useState('');
   const [saveNoteStatus, setSaveNoteStatus] = useState('idle'); // 'idle' | 'saving' | 'saved'
 
-  const activeRemoteStream = remoteStreamState || remoteStreamRef.current;
-  const isRemoteVideoActive =
-    isRemoteConnected &&
-    Boolean(
-      activeRemoteStream &&
-      (activeRemoteStream.getVideoTracks?.()?.length || 0) > 0 &&
-      activeRemoteStream.getVideoTracks()[0]?.enabled !== false
-    );
+  // Dynamic peer count evaluation: local user + connected remote peer(s)
+  // Guaranteed minimum 2 peers in non-solo mode to eliminate single-box waiting state
+  const remotePeerUids = (() => {
+    if (isSoloTest) return [];
+    const fromParticipants = (roomParticipants || []).filter((id) => id && id !== user?.uid);
+    if (fromParticipants.length > 0) {
+      return fromParticipants.slice(0, 4); // Max 4 remote peers + 1 local = 5
+    }
+    if (otherUid && otherUid !== user?.uid) {
+      return [otherUid];
+    }
+    return ['waiting_partner'];
+  })();
+
+  const totalActivePeers = isSoloTest ? 1 : Math.min(5, Math.max(2, remotePeerUids.length + 1));
+
+  // Primary remote peer helpers (for Spotlight & Voice-Only modes)
+  const primaryRemoteUid = remotePeerUids[0];
+  const primaryRemoteProfile = participantProfiles[primaryRemoteUid] || (primaryRemoteUid === otherUid ? otherProfile : null);
+  const primaryRemoteStream = remoteStreams[primaryRemoteUid] || remoteStreamsRef.current[primaryRemoteUid];
+  const primaryRemoteVol = remoteVolumes[primaryRemoteUid] || 0;
+  const isPrimaryRemoteSpeaking = primaryRemoteVol > 15;
+  const isPrimaryRemoteVideoActive = Boolean(
+    primaryRemoteStream &&
+    (primaryRemoteStream.getVideoTracks?.()?.length || 0) > 0 &&
+    primaryRemoteStream.getVideoTracks()[0]?.enabled !== false
+  );
 
   // Active speaker detection state (calibrated Web Audio RMS volume > 15)
   const isLocalSpeaking = Boolean(micEnabled && micVolume > 15);
-  const isRemoteSpeaking = Boolean(isRemoteConnected && remoteVolume > 15);
-
-  // Dynamic peer count evaluation: local user + connected remote peer(s)
-  // Dynamic peer count evaluation — capped at 3 per SPEC-003
-  const totalActivePeers = (() => {
-    if (isSoloTest) return 1;
-    if (!isRemoteConnected || isSearchingNext) return 1;
-    if (roomParticipants.length > 2) {
-      return Math.min(3, Math.max(2, roomParticipants.length));
-    }
-    return 2;
-  })();
 
   // Solid Amber glowing border for active speaker (Feature B.01)
   const getSpeakerBorderClass = (isSpeaking) =>
@@ -292,7 +323,7 @@ function CallRoomInner() {
       ? 'border-amber-500 shadow-[0_0_15px_rgba(245,158,11,0.35)] ring-2 ring-amber-500/50'
       : 'border-white/10 shadow-2xl';
 
-  // CSS Grid auto-packing matrix (Feature B.01)
+  // CSS Grid auto-packing matrix for 1 to 5 peers
   const getGridContainerClass = () => {
     if (totalActivePeers === 1) {
       return 'w-full h-full flex items-center justify-center p-2';
@@ -303,7 +334,25 @@ function CallRoomInner() {
     if (totalActivePeers === 3 || totalActivePeers === 4) {
       return 'w-full h-full grid grid-cols-2 grid-rows-2 gap-3';
     }
-    return 'w-full h-full grid grid-cols-3 grid-rows-2 gap-2.5';
+    return 'w-full h-full grid grid-cols-6 grid-rows-2 gap-2.5';
+  };
+
+  const getCardSpanClass = (peerIndex, totalPeers) => {
+    if (totalPeers <= 2) return 'w-full h-full min-h-0';
+    if (totalPeers === 3) {
+      return peerIndex === 2
+        ? 'col-span-2 row-span-1 max-w-2xl mx-auto w-full h-full min-h-0'
+        : 'col-span-1 row-span-1 w-full h-full min-h-0';
+    }
+    if (totalPeers === 4) {
+      return 'col-span-1 row-span-1 w-full h-full min-h-0';
+    }
+    if (totalPeers === 5) {
+      return peerIndex < 3
+        ? 'col-span-2 row-span-1 w-full h-full min-h-0'
+        : 'col-span-3 row-span-1 max-w-2xl mx-auto w-full h-full min-h-0';
+    }
+    return 'w-full h-full min-h-0';
   };
 
   // Reset single-save guard when roomId changes
@@ -344,16 +393,6 @@ function CallRoomInner() {
     }
   }, [localStreamState, screenSharing, isCameraOn, currentRoomId, layoutMode]);
 
-  // Reactive remote stream assignment: guarantees remoteVideoRef receives active remote stream
-  useEffect(() => {
-    const stream = remoteStreamState || remoteStreamRef.current;
-    if (remoteVideoRef.current && stream) {
-      if (remoteVideoRef.current.srcObject !== stream) {
-        remoteVideoRef.current.srcObject = stream;
-      }
-      remoteVideoRef.current.play().catch(() => {});
-    }
-  }, [remoteStreamState, isRemoteVideoActive, isRemoteConnected, currentRoomId, layoutMode]);
 
   // ── Unmount Cleanup: Commit Call Record on Browser Back / Tab Close ──────
   useEffect(() => {
@@ -382,6 +421,7 @@ function CallRoomInner() {
   useEffect(() => {
     return () => {
       if (matchPollRef.current) clearInterval(matchPollRef.current);
+      if (matchDebounceTimeoutRef.current) clearTimeout(matchDebounceTimeoutRef.current);
       if (matchUnsubRef.current) matchUnsubRef.current();
       if (queueUnsubRef.current) queueUnsubRef.current();
     };
@@ -481,60 +521,64 @@ function CallRoomInner() {
     };
   }, [micEnabled, currentRoomId, isSearchingNext, localStreamState]);
 
-  // ── Real-Time Remote Audio Level Meter ──────────────────────────────────
-  useEffect(() => {
-    if (
-      !remoteStreamRef.current ||
-      !isRemoteConnected ||
-      (remoteStreamRef.current.getAudioTracks?.()?.length || 0) === 0
-    ) {
-      setRemoteVolume(0);
-      return;
-    }
-    let animationFrameId;
-    let audioContext = null;
+  // ── Per-Peer Audio Level Meter (Web Audio API AnalyserNode) ─────────────
+  const attachPeerAudioAnalyser = useCallback((peerUid, stream) => {
     try {
+      const audioTracks = stream.getAudioTracks?.() || [];
+      if (!audioTracks.length) return;
+
+      if (audioContextsRef.current[peerUid]) {
+        const prev = audioContextsRef.current[peerUid];
+        if (prev.animId) cancelAnimationFrame(prev.animId);
+        prev.ctx?.close().catch(() => {});
+        delete audioContextsRef.current[peerUid];
+      }
+
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (AudioCtx) {
-        audioContext = new AudioCtx();
-        const source = audioContext.createMediaStreamSource(remoteStreamRef.current);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 64;
-        analyser.smoothingTimeConstant = 0.4;
-        source.connect(analyser);
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.4;
+      source.connect(analyser);
 
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        const updateRemoteVolume = () => {
-          analyser.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
-          const avg = sum / (dataArray.length || 1);
-          setRemoteVolume(Math.min(100, Math.round((avg / 128) * 100)));
-          animationFrameId = requestAnimationFrame(updateRemoteVolume);
-        };
-        updateRemoteVolume();
-      }
-    } catch {
-      /* AudioContext gesture fallback */
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const updateVol = () => {
+        if (!audioContextsRef.current[peerUid]) return;
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const avg = sum / (dataArray.length || 1);
+        const vol = Math.min(100, Math.round((avg / 128) * 100));
+        setRemoteVolumes((prev) => (prev[peerUid] === vol ? prev : { ...prev, [peerUid]: vol }));
+        if (audioContextsRef.current[peerUid]) {
+          audioContextsRef.current[peerUid].animId = requestAnimationFrame(updateVol);
+        }
+      };
+
+      audioContextsRef.current[peerUid] = { ctx, analyser, animId: 0 };
+      audioContextsRef.current[peerUid].animId = requestAnimationFrame(updateVol);
+    } catch (err) {
+      console.warn('[CallRoom] attachPeerAudioAnalyser error:', err);
     }
+  }, []);
 
-    return () => {
-      if (animationFrameId) cancelAnimationFrame(animationFrameId);
-      if (audioContext) {
-        audioContext.close().catch(() => {});
-      }
-    };
-  }, [isRemoteConnected, otherUid, remoteStreamState]);
-
-  // ── Clean up media streams and WebRTC instances ────────────────────────
+  // ── Clean up media streams and WebRTC instances (Law 11 & 13 Compliant) ───
   const teardownMediaTracks = useCallback(() => {
     if (disconnectTimeoutRef.current) {
       clearTimeout(disconnectTimeoutRef.current);
       disconnectTimeoutRef.current = null;
     }
 
+    if (subtitleTimerRef.current) {
+      clearTimeout(subtitleTimerRef.current);
+      subtitleTimerRef.current = null;
+    }
+
+    // Stop and release local stream tracks
     if (localStreamRef.current) {
       try {
         localStreamRef.current.getTracks?.().forEach((t) => {
@@ -550,6 +594,7 @@ function CallRoomInner() {
       localStreamRef.current = null;
     }
 
+    // Stop and release screen share tracks
     if (screenStreamRef.current) {
       try {
         screenStreamRef.current.getTracks?.().forEach((t) => {
@@ -565,9 +610,10 @@ function CallRoomInner() {
       screenStreamRef.current = null;
     }
 
-    if (remoteStreamRef.current) {
+    // Stop and release all multi-peer remote streams
+    Object.keys(remoteStreamsRef.current).forEach((pUid) => {
       try {
-        remoteStreamRef.current.getTracks?.().forEach((t) => {
+        remoteStreamsRef.current[pUid]?.getTracks?.().forEach((t) => {
           try {
             t.stop();
           } catch {
@@ -577,8 +623,18 @@ function CallRoomInner() {
       } catch {
         /* best effort */
       }
-      remoteStreamRef.current = null;
-    }
+    });
+    remoteStreamsRef.current = {};
+
+    // Close all multi-peer RTCPeerConnection instances
+    Object.keys(pcsRef.current).forEach((pUid) => {
+      try {
+        pcsRef.current[pUid]?.close();
+      } catch {
+        /* best effort */
+      }
+    });
+    pcsRef.current = {};
 
     if (pcRef.current) {
       try {
@@ -589,22 +645,48 @@ function CallRoomInner() {
       pcRef.current = null;
     }
 
+    // Close all AudioContext instances (Law 13)
+    Object.keys(audioContextsRef.current).forEach((pUid) => {
+      const item = audioContextsRef.current[pUid];
+      if (item) {
+        if (item.animId) cancelAnimationFrame(item.animId);
+        item.ctx?.close().catch(() => {});
+      }
+    });
+    audioContextsRef.current = {};
+
+    // Unsubscribe all mesh signaling listeners
+    Object.keys(meshUnsubsRef.current).forEach((pUid) => {
+      const unsubs = meshUnsubsRef.current[pUid] || [];
+      unsubs.forEach((unsub) => {
+        try {
+          unsub();
+        } catch {
+          /* best effort */
+        }
+      });
+    });
+    meshUnsubsRef.current = {};
+
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = null;
+    if (screenVideoRef.current) {
+      screenVideoRef.current.srcObject = null;
     }
     setLocalStreamState(null);
-    setRemoteStreamState(null);
+    setRemoteStreams({});
+    setRemoteVolumes({});
   }, []);
 
   // ── Stop match search polling ───────────────────────────────────────────
   const stopMatchSearch = useCallback(() => {
     if (matchPollRef.current) clearInterval(matchPollRef.current);
+    if (matchDebounceTimeoutRef.current) clearTimeout(matchDebounceTimeoutRef.current);
     if (matchUnsubRef.current) matchUnsubRef.current();
     if (queueUnsubRef.current) queueUnsubRef.current();
     matchPollRef.current = null;
+    matchDebounceTimeoutRef.current = null;
     matchUnsubRef.current = null;
     queueUnsubRef.current = null;
     searchAttemptsRef.current = 0;
@@ -697,8 +779,20 @@ function CallRoomInner() {
         age: profile.age,
       });
 
-      // Polling & real-time tryMatch attempt
+      // Polling & real-time tryMatch attempt with quota-protective debouncing
+      let lastMatchAttemptTime = 0;
       const attemptMatch = async () => {
+        const now = Date.now();
+        if (now - lastMatchAttemptTime < 2500) {
+          if (!matchDebounceTimeoutRef.current) {
+            matchDebounceTimeoutRef.current = setTimeout(() => {
+              matchDebounceTimeoutRef.current = null;
+              attemptMatch();
+            }, 2500 - (now - lastMatchAttemptTime));
+          }
+          return;
+        }
+        lastMatchAttemptTime = now;
         searchAttemptsRef.current += 1;
         try {
           const matchedRoom = await tryMatch(user.uid, {
@@ -736,7 +830,8 @@ function CallRoomInner() {
       );
 
       await attemptMatch();
-      matchPollRef.current = setInterval(attemptMatch, 1500);
+      // Watchdog fallback polling at 10s protects Firestore read quota
+      matchPollRef.current = setInterval(attemptMatch, 10000);
     } catch (err) {
       console.error('[CallRoom] handleNextStranger matchmaking error:', err);
       setIsSearchingNext(false);
@@ -824,17 +919,28 @@ function CallRoomInner() {
 
         const participants = callData.participants || [];
 
-        // SPEC-003: Room capacity guard — max 3 participants
-        if (
-          isMounted &&
-          participants.length >= 3 &&
-          !participants.includes(user.uid)
-        ) {
-          setRoomFullBlocked(true);
+        // SPEC-005: Deep-Link Invite Join Flow & 5-Peer Capacity Guard
+        if (!participants.includes(user.uid)) {
+          if (participants.length >= 5) {
+            if (isMounted) setRoomFullBlocked(true);
+            return;
+          }
+          // Authenticated user arriving via invite link — atomically append user.uid
+          if (!hasAttemptedJoinRef.current[currentRoomId]) {
+            hasAttemptedJoinRef.current[currentRoomId] = true;
+            updateDoc(doc(db, 'calls', currentRoomId), {
+              participants: arrayUnion(user.uid),
+              updatedAt: serverTimestamp(),
+            }).catch((err) => {
+              console.warn('[CallRoom] arrayUnion invite join error:', err);
+              hasAttemptedJoinRef.current[currentRoomId] = false;
+            });
+          }
           return;
         }
 
         if (isMounted) {
+          setRoomFullBlocked(false);
           setRoomParticipants(participants);
           if (Array.isArray(participants) && participants.length > 0) {
             participants.forEach(async (pUid) => {
@@ -899,9 +1005,16 @@ function CallRoomInner() {
     return () => clearInterval(timer);
   }, [leaveCallExplicit, mode, timeLeft, isSearchingNext, strangerLeftOpen]);
 
-  // ── Universal Media Stream Acquisition ──────────────────────────────────
+  // ── Universal Media Stream Acquisition (Persistent Hardware Stream) ────────
   const safeGetMediaStream = useCallback(async () => {
-    // For all video modes: simple universal constraints { video: true, audio: true }
+    // If localStreamRef already has live tracks, reuse it to eliminate camera flicker
+    if (localStreamRef.current) {
+      const activeTracks = localStreamRef.current.getTracks?.().filter((t) => t.readyState === 'live') || [];
+      if (activeTracks.length > 0) {
+        return localStreamRef.current;
+      }
+    }
+
     if (!isVoiceOnly) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -912,7 +1025,6 @@ function CallRoomInner() {
       } catch (tier1Err) {
         console.warn('[CallRoom] Universal video+audio query failed:', tier1Err?.name || tier1Err);
 
-        // Fallback 1: Video-only
         try {
           const videoStream = await navigator.mediaDevices.getUserMedia({
             video: true,
@@ -924,7 +1036,6 @@ function CallRoomInner() {
           console.warn('[CallRoom] Universal video-only fallback failed:', tier2Err?.name || tier2Err);
         }
 
-        // Fallback 2: Audio-only
         try {
           const audioStream = await navigator.mediaDevices.getUserMedia({
             video: false,
@@ -936,14 +1047,12 @@ function CallRoomInner() {
           console.warn('[CallRoom] Universal audio-only failed:', tier3Err?.name || tier3Err);
         }
 
-        // Fallback 3: Both denied or unavailable
         console.warn('[CallRoom] Entering room in receive-only mode.');
         setIsCameraOn(false);
         setMicEnabled(false);
         return null;
       }
     } else {
-      // Voice-only mode — acquire Audio only
       try {
         const audioStream = await navigator.mediaDevices.getUserMedia({
           video: false,
@@ -960,73 +1069,27 @@ function CallRoomInner() {
     }
   }, [isVoiceOnly]);
 
-  // ── 100% Native WebRTC PeerConnection + Firestore Signaling ─────────────
-  useEffect(() => {
-    if (!user || isSearchingNext || strangerLeftOpen) return;
+  // ── Multi-Peer Mesh Connection Helper ───────────────────────────────────
+  const connectToPeer = useCallback(
+    async (peerUid, stream) => {
+      if (!user?.uid || !peerUid || peerUid === user.uid || pcsRef.current[peerUid]) return;
 
-    let isCancelled = false;
-    let unsubCall = null;
-    let unsubCandidates = null;
-
-    const initWebRTC = async () => {
-      setCallError('');
-
-      // 1. Acquire local stream
-      const stream = await safeGetMediaStream();
-      if (isCancelled) {
-        if (stream) stream.getTracks?.().forEach((t) => t.stop());
-        return;
-      }
-
-      if (stream) {
-        localStreamRef.current = stream;
-        setLocalStreamState(stream);
-        setRemoteStreamState(null);
-        const hasVideo = Boolean(stream.getVideoTracks?.()?.length && stream.getVideoTracks()[0].enabled);
-        const hasAudio = Boolean(stream.getAudioTracks?.()?.length && stream.getAudioTracks()[0].enabled);
-        setIsCameraOn(hasVideo);
-        setMicEnabled(hasAudio);
-
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-          localVideoRef.current.muted = true;
-          localVideoRef.current.volume = 0;
-          localVideoRef.current.play().catch(() => {});
-        }
-      } else {
-        localStreamRef.current = null;
-        setLocalStreamState(null);
-        setRemoteStreamState(null);
-        setIsCameraOn(false);
-        setMicEnabled(false);
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = null;
-        }
-      }
-
-      // 2. Solo / Practice Test Room: Local preview only
-      if (isSoloTest) {
-        setIsRemoteConnected(true);
-        return;
-      }
-
-      // 3. Real WebRTC PeerConnection Setup
       try {
         const pc = new RTCPeerConnection(ICE_SERVERS);
-        pcRef.current = pc;
+        pcsRef.current[peerUid] = pc;
+        const peerUnsubs = [];
 
-        // Add local tracks to peer connection
+        // 1. Add local tracks to peer connection
         if (stream) {
           stream.getTracks?.().forEach((track) => {
             try {
               pc.addTrack(track, stream);
-            } catch (e) {
-              console.warn('[WebRTC] addTrack error:', e);
+            } catch (err) {
+              console.warn(`[WebRTC] addTrack to peer ${peerUid} error:`, err);
             }
           });
         }
 
-        // Add receive-only transceivers if audio or video track is not publishing
         const hasAudioTrack = Boolean(stream?.getAudioTracks?.()?.length);
         const hasVideoTrack = Boolean(stream?.getVideoTracks?.()?.length);
 
@@ -1045,33 +1108,25 @@ function CallRoomInner() {
           }
         }
 
-        // Handle remote stream tracks
+        // 2. Handle remote stream tracks from this peer
         pc.ontrack = (event) => {
+          let pStream = remoteStreamsRef.current[peerUid];
           if (event.streams && event.streams[0]) {
-            remoteStreamRef.current = event.streams[0];
-            setRemoteStreamState(event.streams[0]);
-            if (remoteVideoRef.current) {
-              remoteVideoRef.current.srcObject = event.streams[0];
-              remoteVideoRef.current.play().catch(() => {});
-            }
-            cancelDisconnect();
-            setIsRemoteConnected(true);
+            pStream = event.streams[0];
           } else if (event.track) {
-            if (!remoteStreamRef.current) {
-              remoteStreamRef.current = new MediaStream();
-            }
-            remoteStreamRef.current.addTrack(event.track);
-            setRemoteStreamState(remoteStreamRef.current);
-            if (remoteVideoRef.current) {
-              remoteVideoRef.current.srcObject = remoteStreamRef.current;
-              remoteVideoRef.current.play().catch(() => {});
-            }
+            if (!pStream) pStream = new MediaStream();
+            pStream.addTrack(event.track);
+          }
+          if (pStream) {
+            remoteStreamsRef.current[peerUid] = pStream;
+            setRemoteStreams((prev) => ({ ...prev, [peerUid]: pStream }));
+            attachPeerAudioAnalyser(peerUid, pStream);
             cancelDisconnect();
             setIsRemoteConnected(true);
           }
         };
 
-        // Connection state changes with 2000ms debounce
+        // 3. Connection state changes
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'connected') {
             cancelDisconnect();
@@ -1081,7 +1136,12 @@ function CallRoomInner() {
             pc.connectionState === 'failed' ||
             pc.connectionState === 'closed'
           ) {
-            scheduleDisconnect();
+            const anyActive = Object.values(pcsRef.current).some(
+              (p) => p.connectionState === 'connected'
+            );
+            if (!anyActive) {
+              scheduleDisconnect();
+            }
           }
         };
 
@@ -1094,42 +1154,26 @@ function CallRoomInner() {
             pc.iceConnectionState === 'failed' ||
             pc.iceConnectionState === 'closed'
           ) {
-            scheduleDisconnect();
+            const anyActive = Object.values(pcsRef.current).some(
+              (p) => p.iceConnectionState === 'connected' || p.iceConnectionState === 'completed'
+            );
+            if (!anyActive) {
+              scheduleDisconnect();
+            }
           }
         };
 
-        // Deterministic role: URL role param, callerUid if set, or roomId segments comparison
-        const roleParam = searchParams?.get('role');
-        const roomSegments = currentRoomId.split('_');
-        const defaultCaller = roomSegments.length >= 2 ? roomSegments[0] : null;
+        // 4. Deterministic Offer/Answer via UID comparison:
+        // (myUid > peerUid) initiates SDP offer; (myUid < peerUid) answers SDP offer
+        const isInitiator = user.uid > peerUid;
 
-        const callDocRef = doc(db, 'calls', currentRoomId);
-        let callerUid = null;
-        try {
-          const callSnap = await getDoc(callDocRef);
-          if (callSnap.exists()) {
-            callerUid = callSnap.data()?.callerUid;
-          }
-        } catch {
-          /* fallback */
-        }
-
-        const isCaller = roleParam === 'caller'
-          ? true
-          : roleParam === 'callee'
-          ? false
-          : (callerUid ? user.uid === callerUid : (defaultCaller ? user.uid === defaultCaller : true));
-
-        const myCandidateColl = isCaller ? 'callerCandidates' : 'calleeCandidates';
-        const remoteCandidateColl = isCaller ? 'calleeCandidates' : 'callerCandidates';
-
-        // Send local ICE candidates to Firestore (capped to top 6 to optimize quota & connection speed)
-        let localCandidateCount = 0;
+        // Local ICE candidate collection
+        let candidateCount = 0;
         pc.onicecandidate = (event) => {
-          if (event.candidate && currentRoomId && localCandidateCount < 6) {
-            localCandidateCount++;
+          if (event.candidate && currentRoomId && candidateCount < 8) {
+            candidateCount++;
             addDoc(
-              collection(db, 'calls', currentRoomId, myCandidateColl),
+              collection(db, 'calls', currentRoomId, `candidates_${user.uid}_${peerUid}`),
               event.candidate.toJSON()
             ).catch(() => {});
           }
@@ -1140,107 +1184,107 @@ function CallRoomInner() {
           while (candidateQueue.length > 0) {
             const c = candidateQueue.shift();
             try {
-              if (pcRef.current && pc.signalingState !== 'closed') {
+              if (pcsRef.current[peerUid] && pc.signalingState !== 'closed') {
                 await pc.addIceCandidate(c);
               }
             } catch {
-              /* candidate error ignore */
+              /* candidate buffering ignore */
             }
           }
         };
 
-        if (isCaller) {
-          if (isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-          // Caller: Create and save offer
-          const offerDescription = await pc.createOffer({
+        const mySignalDocRef = doc(db, 'calls', currentRoomId, 'signals', `${user.uid}_${peerUid}`);
+        const peerSignalDocRef = doc(db, 'calls', currentRoomId, 'signals', `${peerUid}_${user.uid}`);
+
+        if (isInitiator) {
+          // Initiator: Create and publish SDP Offer
+          const offer = await pc.createOffer({
             offerToReceiveAudio: true,
             offerToReceiveVideo: true,
           });
-          if (isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-          await pc.setLocalDescription(offerDescription);
+          if (pc.signalingState === 'closed') return;
+          await pc.setLocalDescription(offer);
 
           await setDoc(
-            callDocRef,
+            mySignalDocRef,
             {
-              offer: { sdp: offerDescription.sdp, type: offerDescription.type },
-              callerUid: user.uid,
-              status: 'active',
-              isEnded: false,
+              offer: { sdp: offer.sdp, type: offer.type },
+              fromUid: user.uid,
+              toUid: peerUid,
               updatedAt: serverTimestamp(),
             },
             { merge: true }
           );
 
-          // Listen for Callee answer
-          unsubCall = onSnapshot(callDocRef, async (snapshot) => {
-            if (!snapshot.exists() || isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-            const data = snapshot.data();
-            if (!data) return;
-
-            if (data.answer && !pc.currentRemoteDescription && pc.signalingState === 'have-local-offer') {
+          // Listen for Answer from peer
+          const unsubPeerSignal = onSnapshot(peerSignalDocRef, async (snap) => {
+            if (!snap.exists() || pc.signalingState === 'closed') return;
+            const data = snap.data();
+            if (data?.answer && !pc.currentRemoteDescription && pc.signalingState === 'have-local-offer') {
               try {
-                if (pc.signalingState !== 'have-local-offer') return;
-                const answerDescription = new RTCSessionDescription(data.answer);
-                await pc.setRemoteDescription(answerDescription);
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
                 await flushCandidates();
               } catch (err) {
-                console.warn('[WebRTC Caller] setRemoteDescription notice:', err?.message || err);
+                console.warn(`[WebRTC Initiator] setRemoteDescription notice with ${peerUid}:`, err?.message || err);
               }
             }
           });
+          peerUnsubs.push(unsubPeerSignal);
         } else {
-          // Callee: Wait for Caller's offer, then create and save answer
+          // Answerer: Wait for Offer from peer, then create and publish SDP Answer
           let hasAnswered = false;
-          unsubCall = onSnapshot(callDocRef, async (snapshot) => {
-            if (!snapshot.exists() || isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-            const data = snapshot.data();
-            if (!data) return;
-
+          const unsubPeerSignal = onSnapshot(peerSignalDocRef, async (snap) => {
+            if (!snap.exists() || pc.signalingState === 'closed') return;
+            const data = snap.data();
             if (
-              data.offer &&
+              data?.offer &&
               !hasAnswered &&
               !pc.currentRemoteDescription &&
               (pc.signalingState === 'stable' || pc.signalingState === 'have-remote-offer')
             ) {
               hasAnswered = true;
               try {
-                const offerDescription = new RTCSessionDescription(data.offer);
-                await pc.setRemoteDescription(offerDescription);
+                await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
                 await flushCandidates();
 
-                if (isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-                const answerDescription = await pc.createAnswer({
+                if (pc.signalingState === 'closed') return;
+                const answer = await pc.createAnswer({
                   offerToReceiveAudio: true,
                   offerToReceiveVideo: true,
                 });
-                if (isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
-                await pc.setLocalDescription(answerDescription);
+                if (pc.signalingState === 'closed') return;
+                await pc.setLocalDescription(answer);
 
-                await updateDoc(callDocRef, {
-                  answer: { sdp: answerDescription.sdp, type: answerDescription.type },
-                  calleeUid: user.uid,
-                  status: 'active',
-                  updatedAt: serverTimestamp(),
-                });
+                await setDoc(
+                  mySignalDocRef,
+                  {
+                    answer: { sdp: answer.sdp, type: answer.type },
+                    fromUid: user.uid,
+                    toUid: peerUid,
+                    updatedAt: serverTimestamp(),
+                  },
+                  { merge: true }
+                );
               } catch (err) {
-                console.error('[WebRTC Callee] negotiation error:', err);
+                console.error(`[WebRTC Answerer] negotiation error with ${peerUid}:`, err);
                 hasAnswered = false;
               }
             }
           });
+          peerUnsubs.push(unsubPeerSignal);
         }
 
-        // Listen for remote ICE candidates
-        unsubCandidates = onSnapshot(
-          collection(db, 'calls', currentRoomId, remoteCandidateColl),
+        // 5. Listen for remote ICE candidates
+        const unsubCandidates = onSnapshot(
+          collection(db, 'calls', currentRoomId, `candidates_${peerUid}_${user.uid}`),
           (snapshot) => {
-            if (!snapshot || snapshot.empty || isCancelled || !pcRef.current || pc.signalingState === 'closed') return;
+            if (!snapshot || snapshot.empty || pc.signalingState === 'closed') return;
             snapshot.docChanges().forEach(async (change) => {
               if (change.type === 'added') {
                 try {
-                  const candidateData = change.doc.data();
-                  if (candidateData && candidateData.candidate) {
-                    const candidate = new RTCIceCandidate(candidateData);
+                  const cData = change.doc.data();
+                  if (cData && cData.candidate) {
+                    const candidate = new RTCIceCandidate(cData);
                     if (!pc.remoteDescription) {
                       candidateQueue.push(candidate);
                     } else {
@@ -1248,45 +1292,161 @@ function CallRoomInner() {
                     }
                   }
                 } catch {
-                  /* candidate buffering */
+                  /* candidate buffering ignore */
                 }
               }
             });
           }
         );
+        peerUnsubs.push(unsubCandidates);
+
+        meshUnsubsRef.current[peerUid] = peerUnsubs;
       } catch (err) {
-        console.error('[CallRoom] WebRTC connection error:', err);
-        if (!isCancelled) {
-          setCallError('Direct connection error. Retrying...');
+        console.error(`[CallRoom] WebRTC connectToPeer error for ${peerUid}:`, err);
+      }
+    },
+    [user?.uid, currentRoomId, isVoiceOnly, attachPeerAudioAnalyser, cancelDisconnect, scheduleDisconnect]
+  );
+
+  // ── Multi-Peer Mesh WebRTC Lifecycle ────────────────────────────────────
+  useEffect(() => {
+    if (!user || isSearchingNext || strangerLeftOpen) return;
+
+    let isCancelled = false;
+
+    const initWebRTC = async () => {
+      setCallError('');
+
+      // 1. Acquire local persistent hardware stream
+      const stream = await safeGetMediaStream();
+      if (isCancelled) {
+        return;
+      }
+
+      if (stream) {
+        localStreamRef.current = stream;
+        setLocalStreamState(stream);
+        const hasVideo = Boolean(stream.getVideoTracks?.()?.length && stream.getVideoTracks()[0].enabled);
+        const hasAudio = Boolean(stream.getAudioTracks?.()?.length && stream.getAudioTracks()[0].enabled);
+        setIsCameraOn(hasVideo);
+        setMicEnabled(hasAudio);
+
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+          localVideoRef.current.muted = true;
+          localVideoRef.current.volume = 0;
+          localVideoRef.current.play().catch(() => {});
+        }
+      } else {
+        localStreamRef.current = null;
+        setLocalStreamState(null);
+        setIsCameraOn(false);
+        setMicEnabled(false);
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = null;
         }
       }
+
+      // 2. Solo / Practice Test Room: Local preview only
+      if (isSoloTest) {
+        setIsRemoteConnected(true);
+        return;
+      }
+
+      // 3. Multi-Peer Mesh Signaling: connect to all target remote peers
+      const targetPeers = Array.from(
+        new Set([
+          ...(roomParticipants || []).filter((id) => id && id !== user.uid),
+          ...(otherUid && otherUid !== user.uid ? [otherUid] : []),
+        ])
+      ).slice(0, 4);
+
+      // Clean up connections for peers who left the room
+      Object.keys(pcsRef.current).forEach((pUid) => {
+        if (!targetPeers.includes(pUid)) {
+          try {
+            pcsRef.current[pUid]?.close();
+          } catch {
+            /* ignore */
+          }
+          delete pcsRef.current[pUid];
+          if (meshUnsubsRef.current[pUid]) {
+            meshUnsubsRef.current[pUid].forEach((u) => {
+              try {
+                u();
+              } catch {
+                /* ignore */
+              }
+            });
+            delete meshUnsubsRef.current[pUid];
+          }
+          if (audioContextsRef.current[pUid]) {
+            const item = audioContextsRef.current[pUid];
+            if (item.animId) cancelAnimationFrame(item.animId);
+            item.ctx?.close().catch(() => {});
+            delete audioContextsRef.current[pUid];
+          }
+          delete remoteStreamsRef.current[pUid];
+          setRemoteStreams((prev) => {
+            const next = { ...prev };
+            delete next[pUid];
+            return next;
+          });
+        }
+      });
+
+      // Establish connections for all active peers
+      targetPeers.forEach((pUid) => {
+        if (!pcsRef.current[pUid]) {
+          connectToPeer(pUid, stream);
+        }
+      });
     };
 
     initWebRTC();
 
     return () => {
       isCancelled = true;
-      cancelDisconnect();
-      if (unsubCall) unsubCall();
-      if (unsubCandidates) unsubCandidates();
-      teardownMediaTracks();
     };
   }, [
     currentRoomId,
     user,
     isSoloTest,
-    isPrivateRoom,
-    isVoiceOnly,
     isSearchingNext,
     strangerLeftOpen,
+    roomParticipants,
+    otherUid,
     safeGetMediaStream,
-    teardownMediaTracks,
-    scheduleDisconnect,
-    cancelDisconnect,
-    searchParams,
+    connectToPeer,
   ]);
 
-  // ── Live Mic Speech Recognition Subtitles ───────────────────────────────
+  // Check friendship statuses for all active peers
+  useEffect(() => {
+    if (!user?.uid) return;
+    const targetUids = (roomParticipants || []).filter((id) => id && id !== user.uid);
+    if (otherUid && !targetUids.includes(otherUid)) targetUids.push(otherUid);
+
+    targetUids.forEach(async (tUid) => {
+      if (!tUid || tUid === 'waiting_partner') return;
+      try {
+        const isFr = await checkIsFriend(user.uid, tUid);
+        if (isFr) {
+          setFriendStatuses((prev) => ({ ...prev, [tUid]: 'friends' }));
+        } else {
+          const pending = await checkPendingRequest(user.uid, tUid);
+          if (pending) {
+            setFriendStatuses((prev) => ({ ...prev, [tUid]: 'pending' }));
+          } else {
+            setFriendStatuses((prev) => ({ ...prev, [tUid]: 'none' }));
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+  }, [user?.uid, roomParticipants, otherUid]);
+
+  // ── Live Mic Speech Recognition Subtitles (1-Line Clamped + 2s Auto-Decay) ───
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
@@ -1295,10 +1455,27 @@ function CallRoomInner() {
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = navigator.language || 'en-US';
+
     recognition.onresult = (e) => {
       const r = e.results[e.results.length - 1];
-      setSubtitle(r[0]?.transcript || '');
+      const rawTranscript = r[0]?.transcript || '';
+      if (rawTranscript.trim()) {
+        // Clamp strictly to the last 6 to 8 words (1 short single line)
+        const words = rawTranscript.trim().split(/\s+/);
+        const clamped = words.slice(-8).join(' ');
+        setSubtitle(clamped);
+
+        // 2-Second silence auto-clear decay timer
+        if (subtitleTimerRef.current) {
+          clearTimeout(subtitleTimerRef.current);
+        }
+        subtitleTimerRef.current = setTimeout(() => {
+          setSubtitle('');
+          subtitleTimerRef.current = null;
+        }, 2000);
+      }
     };
+
     recognition.onend = () => {
       try {
         recognition.start();
@@ -1315,6 +1492,10 @@ function CallRoomInner() {
     recognitionRef.current = recognition;
 
     return () => {
+      if (subtitleTimerRef.current) {
+        clearTimeout(subtitleTimerRef.current);
+        subtitleTimerRef.current = null;
+      }
       if (recognitionRef.current) {
         recognitionRef.current.onend = null;
         try {
@@ -1327,7 +1508,7 @@ function CallRoomInner() {
     };
   }, [currentRoomId]);
 
-  // ── Hardware Control Handlers ───────────────────────────────────────────
+  // ── Hardware Control Handlers (Zero Flicker Toggles) ────────────────────
   const toggleMic = useCallback(async () => {
     const audioTracks = localStreamRef.current?.getAudioTracks?.() || [];
     const activeTrack = audioTracks.find((t) => t.readyState === 'live');
@@ -1351,19 +1532,19 @@ function CallRoomInner() {
           setLocalStreamState(localStreamRef.current);
           setMicEnabled(true);
 
-          if (pcRef.current) {
-            const senders = pcRef.current.getSenders?.() || [];
+          Object.values(pcsRef.current).forEach((pc) => {
+            const senders = pc.getSenders?.() || [];
             const audioSender = senders.find((s) => s.track?.kind === 'audio' || s.kind === 'audio');
             if (audioSender) {
-              await audioSender.replaceTrack(newTrack);
+              audioSender.replaceTrack(newTrack).catch(() => {});
             } else {
               try {
-                pcRef.current.addTrack(newTrack, localStreamRef.current);
-              } catch (e) {
-                console.warn('[CallRoom] Failed to add new audio track to RTCPeerConnection:', e);
+                pc.addTrack(newTrack, localStreamRef.current);
+              } catch {
+                /* ignore */
               }
             }
-          }
+          });
         }
       } catch (err) {
         console.warn('[CallRoom] toggleMic acquire audio track error:', err);
@@ -1384,7 +1565,6 @@ function CallRoomInner() {
     const activeTrack = videoTracks.find((t) => t.readyState === 'live');
 
     if (!activeTrack) {
-      // No live video track in local stream — actively acquire camera track
       try {
         const vStream = await navigator.mediaDevices.getUserMedia({
           video: true,
@@ -1409,19 +1589,19 @@ function CallRoomInner() {
           }
           setIsCameraOn(true);
 
-          if (pcRef.current) {
-            const senders = pcRef.current.getSenders?.() || [];
+          Object.values(pcsRef.current).forEach((pc) => {
+            const senders = pc.getSenders?.() || [];
             const videoSender = senders.find((s) => s.track?.kind === 'video' || s.kind === 'video');
             if (videoSender) {
-              await videoSender.replaceTrack(newTrack);
+              videoSender.replaceTrack(newTrack).catch(() => {});
             } else {
               try {
-                pcRef.current.addTrack(newTrack, localStreamRef.current);
-              } catch (e) {
-                console.warn('[CallRoom] Failed to add new video track to RTCPeerConnection:', e);
+                pc.addTrack(newTrack, localStreamRef.current);
+              } catch {
+                /* ignore */
               }
             }
-          }
+          });
         }
       } catch (err) {
         console.warn('[CallRoom] toggleCam acquire video track error:', err);
@@ -1450,13 +1630,13 @@ function CallRoomInner() {
         }
 
         const camTrack = localStreamRef.current?.getVideoTracks?.()[0];
-        if (pcRef.current && camTrack) {
-          const senders = pcRef.current.getSenders?.();
+        Object.values(pcsRef.current).forEach((pc) => {
+          const senders = pc.getSenders?.();
           const videoSender = senders?.find((s) => s.track && s.track.kind === 'video');
-          if (videoSender) {
-            await videoSender.replaceTrack(camTrack);
+          if (videoSender && camTrack) {
+            videoSender.replaceTrack(camTrack).catch(() => {});
           }
-        }
+        });
 
         if (localVideoRef.current && localStreamRef.current) {
           localVideoRef.current.srcObject = localStreamRef.current;
@@ -1474,16 +1654,14 @@ function CallRoomInner() {
         const screenTrack = screenStream.getVideoTracks()[0];
 
         if (screenTrack) {
-          // 1. Swap track on RTCPeerConnection sender
-          if (pcRef.current) {
-            const senders = pcRef.current.getSenders?.();
+          Object.values(pcsRef.current).forEach((pc) => {
+            const senders = pc.getSenders?.();
             const videoSender = senders?.find((s) => s.track && s.track.kind === 'video');
             if (videoSender) {
-              await videoSender.replaceTrack(screenTrack);
+              videoSender.replaceTrack(screenTrack).catch(() => {});
             }
-          }
+          });
 
-          // 2. Display screen on screenVideoRef and preserve webcam on localVideoRef
           if (screenVideoRef.current) {
             screenVideoRef.current.srcObject = screenStream;
             screenVideoRef.current.muted = true;
@@ -1494,16 +1672,15 @@ function CallRoomInner() {
             localVideoRef.current.muted = true;
           }
           setScreenSharing(true);
-          setLayoutMode('spotlight'); // Google Meet style spotlight layout
+          setLayoutMode('spotlight');
 
-          // 3. Revert cleanly when user clicks "Stop Sharing" in Chrome banner
           screenTrack.onended = async () => {
             if (localStreamRef.current) {
               const camTrack = localStreamRef.current.getVideoTracks?.()[0];
-              if (pcRef.current && camTrack) {
-                const videoSender = pcRef.current.getSenders?.().find((s) => s.track && s.track.kind === 'video');
-                if (videoSender) await videoSender.replaceTrack(camTrack);
-              }
+              Object.values(pcsRef.current).forEach((pc) => {
+                const videoSender = pc.getSenders?.().find((s) => s.track && s.track.kind === 'video');
+                if (videoSender && camTrack) videoSender.replaceTrack(camTrack).catch(() => {});
+              });
               if (localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
                 localVideoRef.current.muted = true;
@@ -1579,7 +1756,10 @@ function CallRoomInner() {
   const toggleChatDrawer = () => {
     setChatOpen((prev) => {
       const next = !prev;
-      if (next) setNotesOpen(false);
+      if (next) {
+        setNotesOpen(false);
+        setCardMenuOpenUid(null);
+      }
       return next;
     });
   };
@@ -1608,9 +1788,20 @@ function CallRoomInner() {
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  // SPEC-003: Dynamic 1-click invite link — zero hardcoded domains
-  const copyInviteLink = () => {
+  // SPEC-003/007: Dynamic 1-click invite link with Firestore room provisioning for solo & peer joins
+  const copyInviteLink = async () => {
     const inviteUrl = `${window.location.origin}/call/${currentRoomId}`;
+    try {
+      if (user?.uid) {
+        await ensureCallRoom(currentRoomId, [user.uid], {
+          isPractice: safeRoomId.startsWith('practice_') || mode === 'practice',
+          createdBy: user.uid,
+          active: true,
+        });
+      }
+    } catch (e) {
+      console.warn('[CallRoom] ensureCallRoom on copyInviteLink:', e);
+    }
     navigator.clipboard.writeText(inviteUrl);
     setInviteCopied(true);
     setTimeout(() => setInviteCopied(false), 2000);
@@ -1708,19 +1899,19 @@ function CallRoomInner() {
             </button>
           )}
 
-          {/* SPEC-003: Dynamic 1-Click Invite Friend Link */}
+          {/* SPEC-003/006: High-Contrast Dynamic 1-Click Invite Friend Link */}
           <button
             onClick={copyInviteLink}
-            className={`px-3.5 py-1.5 rounded-full font-extrabold text-xs flex items-center gap-1.5 shadow-[0_2px_12px_rgba(245,158,11,0.35)] transition-all active:scale-95 cursor-pointer ${
+            className={`px-4 py-1.5 rounded-full font-black text-xs flex items-center gap-1.5 shadow-[0_2px_14px_rgba(245,158,11,0.45)] transition-all active:scale-95 cursor-pointer ${
               inviteCopied
-                ? 'bg-emerald-500 hover:bg-emerald-400 text-white'
-                : 'bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950'
+                ? 'bg-emerald-500 hover:bg-emerald-400 text-white font-bold'
+                : 'bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black shadow-lg'
             }`}
           >
             {inviteCopied ? (
               <><Check size={13} className="text-white" /><span>Link Copied!</span></>
             ) : (
-              <><Link2 size={13} /><span>Invite Friend</span></>
+              <><Link2 size={13} className="stroke-[2.5]" /><span>Invite Friend</span></>
             )}
           </button>
         </div>
@@ -1834,7 +2025,17 @@ function CallRoomInner() {
           <div className="w-full h-full flex flex-col md:flex-row items-center justify-center gap-6 p-4 max-w-5xl mx-auto">
             {/* Permanent unrendered media elements for audio playback & ref integrity (Law 12) */}
             <video ref={localVideoRef} autoPlay playsInline muted className="opacity-0 absolute w-1 h-1 pointer-events-none" />
-            <video ref={remoteVideoRef} autoPlay playsInline className="opacity-0 absolute w-1 h-1 pointer-events-none" />
+            <video
+              ref={(el) => {
+                if (el && primaryRemoteStream && el.srcObject !== primaryRemoteStream) {
+                  el.srcObject = primaryRemoteStream;
+                  el.play().catch(() => {});
+                }
+              }}
+              autoPlay
+              playsInline
+              className="opacity-0 absolute w-1 h-1 pointer-events-none"
+            />
 
             {/* Left Card: Local User */}
             <div className="flex-1 w-full h-full max-h-[480px] rounded-3xl bg-[#111318] border border-white/10 shadow-2xl relative flex flex-col items-center justify-center p-6 transition-all duration-300">
@@ -1867,7 +2068,7 @@ function CallRoomInner() {
             {/* Center Dynamic Audio Waveform Visualizer */}
             <div className="flex flex-row md:flex-col items-center justify-center gap-1.5 sm:gap-2 px-2 py-4">
               {[40, 65, 85, 50, 95, 75, 45, 90, 60, 80, 55, 90, 70, 45].map((height, i) => {
-                const isActive = (micVolume > 5 || remoteVolume > 5);
+                const isActive = (micVolume > 5 || primaryRemoteVol > 5);
                 const barScale = isActive
                   ? Math.max(0.2, (Math.sin((i + Date.now() / 200) * 0.8) + 1.2) * 0.5)
                   : 0.15;
@@ -1887,31 +2088,33 @@ function CallRoomInner() {
 
             {/* Right Card: Remote Stranger / Waiting */}
             <div className="flex-1 w-full h-full max-h-[480px] rounded-3xl bg-[#111318] border border-white/10 shadow-2xl relative flex flex-col items-center justify-center p-6 transition-all duration-300">
-              {isRemoteConnected && otherUid ? (
+              {isRemoteConnected && (primaryRemoteUid || otherUid) ? (
                 <>
                   <div
                     onClick={() => {
-                      setInspectingUser({ uid: otherUid, profile: otherProfile });
-                      setProfileModalOpen(true);
+                      if (primaryRemoteProfile || otherProfile) {
+                        setInspectingUser({ uid: primaryRemoteUid || otherUid, profile: primaryRemoteProfile || otherProfile });
+                        setProfileModalOpen(true);
+                      }
                     }}
                     className={`w-28 h-28 sm:w-32 sm:h-32 rounded-full bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-600 p-[3px] cursor-pointer transition-all duration-200 hover:scale-105 active:scale-95 ${
-                      remoteVolume > 8 ? 'scale-105 shadow-[0_0_40px_rgba(252,163,17,0.6)]' : 'shadow-[0_0_25px_rgba(252,163,17,0.25)]'
+                      primaryRemoteVol > 8 ? 'scale-105 shadow-[0_0_40px_rgba(252,163,17,0.6)]' : 'shadow-[0_0_25px_rgba(252,163,17,0.25)]'
                     }`}
                     title="Click to inspect profile"
                   >
                     <div className="w-full h-full rounded-full bg-[#14213D] flex items-center justify-center text-white font-extrabold text-3xl">
-                      {otherProfile?.username?.charAt(0).toUpperCase() || <User size={36} />}
+                      {(primaryRemoteProfile || otherProfile)?.username?.charAt(0).toUpperCase() || <User size={36} />}
                     </div>
                   </div>
 
                   <h4 className="text-lg font-bold text-white mt-4 flex items-center gap-1.5">
-                    <span>{otherProfile?.username || 'Stranger'}</span>
+                    <span>{(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}</span>
                     <ShieldCheck size={16} className="text-emerald-400" />
                   </h4>
 
                   <div className="mt-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-mono text-amber-300 flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                    <span>{remoteVolume > 5 ? 'Speaking...' : 'Connected'}</span>
+                    <span>{primaryRemoteVol > 5 ? 'Speaking...' : 'Connected'}</span>
                   </div>
                 </>
               ) : null}
@@ -1964,47 +2167,52 @@ function CallRoomInner() {
                   </motion.div>
 
                   {/* Remote Partner Filmstrip Tile */}
-                  {isRemoteConnected && otherUid && (
+                  {isRemoteConnected && (primaryRemoteUid || otherUid) && (
                     <motion.div
                       layout
                       layoutId="remote-video-card"
                       transition={springTransition}
-                      className={`h-full aspect-video shrink-0 rounded-2xl bg-[#111318] border overflow-hidden relative flex items-center justify-center transition-all duration-300 ${getSpeakerBorderClass(isRemoteSpeaking)}`}
+                      className={`h-full aspect-video shrink-0 rounded-2xl bg-[#111318] border overflow-hidden relative flex items-center justify-center transition-all duration-300 ${getSpeakerBorderClass(isPrimaryRemoteSpeaking)}`}
                     >
                       <video
-                        ref={remoteVideoRef}
+                        ref={(el) => {
+                          if (el && primaryRemoteStream && el.srcObject !== primaryRemoteStream) {
+                            el.srcObject = primaryRemoteStream;
+                            el.play().catch(() => {});
+                          }
+                        }}
                         autoPlay
                         playsInline
-                        className={`w-full h-full object-cover ${isRemoteVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
+                        className={`w-full h-full object-cover ${isPrimaryRemoteVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
                       />
-                      {!isRemoteVideoActive && (
+                      {!isPrimaryRemoteVideoActive && (
                         <div
                           onClick={() => {
-                            if (otherUid && otherProfile) {
-                              setInspectingUser({ uid: otherUid, profile: otherProfile });
+                            if (primaryRemoteProfile || otherProfile) {
+                              setInspectingUser({ uid: primaryRemoteUid || otherUid, profile: primaryRemoteProfile || otherProfile });
                               setProfileModalOpen(true);
                             }
                           }}
                           className="w-full h-full flex flex-col items-center justify-center bg-slate-900 gap-1 cursor-pointer"
                         >
                           <div className="w-8 h-8 rounded-full bg-[#14213D] border border-white/20 flex items-center justify-center text-amber-400 font-bold text-xs">
-                            {otherProfile?.username?.charAt(0).toUpperCase() || <User size={14} />}
+                            {(primaryRemoteProfile || otherProfile)?.username?.charAt(0).toUpperCase() || <User size={14} />}
                           </div>
-                          <span className="text-[10px] text-slate-300 font-semibold">{otherProfile?.username || 'Stranger'}</span>
+                          <span className="text-[10px] text-slate-300 font-semibold">{(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}</span>
                         </div>
                       )}
                       <div
                         onClick={() => {
-                          if (otherUid && otherProfile) {
-                            setInspectingUser({ uid: otherUid, profile: otherProfile });
+                          if (primaryRemoteProfile || otherProfile) {
+                            setInspectingUser({ uid: primaryRemoteUid || otherUid, profile: primaryRemoteProfile || otherProfile });
                             setProfileModalOpen(true);
                           }
                         }}
                         className="absolute top-2 left-2 z-20 bg-black/60 hover:bg-black/80 backdrop-blur-md px-2 py-0.5 rounded-full text-[10px] font-semibold text-white/95 border border-white/10 flex items-center gap-1.5 cursor-pointer shadow"
                       >
-                        <span className="truncate max-w-[80px]">{otherProfile?.username || 'Stranger'}</span>
+                        <span className="truncate max-w-[80px]">{(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}</span>
                         <ShieldCheck size={11} className="text-emerald-400 shrink-0" />
-                        {isRemoteSpeaking && <Mic size={10} className="text-amber-400 animate-pulse" />}
+                        {isPrimaryRemoteSpeaking && <Mic size={10} className="text-amber-400 animate-pulse" />}
                       </div>
                     </motion.div>
                   )}
@@ -2060,44 +2268,53 @@ function CallRoomInner() {
                     /* Spotlight mode focused partner view */
                     <>
                       <video
-                        ref={remoteVideoRef}
+                        ref={(el) => {
+                          if (el && primaryRemoteStream && el.srcObject !== primaryRemoteStream) {
+                            el.srcObject = primaryRemoteStream;
+                            el.play().catch(() => {});
+                          }
+                        }}
                         autoPlay
                         playsInline
-                        className={`w-full h-full object-cover ${isRemoteConnected && isRemoteVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
+                        className={`w-full h-full object-cover ${isRemoteConnected && isPrimaryRemoteVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
                       />
-                      {isRemoteConnected && otherUid ? (
+                      {isRemoteConnected && (primaryRemoteUid || otherUid) ? (
                         <>
-                          {!isRemoteVideoActive && (
+                          {!isPrimaryRemoteVideoActive && (
                             <div className="absolute inset-0 flex flex-col items-center justify-center">
                               <div
                                 onClick={() => {
-                                  setInspectingUser({ uid: otherUid, profile: otherProfile });
-                                  setProfileModalOpen(true);
+                                  if (primaryRemoteProfile || otherProfile) {
+                                    setInspectingUser({ uid: primaryRemoteUid || otherUid, profile: primaryRemoteProfile || otherProfile });
+                                    setProfileModalOpen(true);
+                                  }
                                 }}
                                 className="w-24 h-24 rounded-full bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-600 p-[3px] shadow-[0_0_30px_rgba(252,163,17,0.35)] cursor-pointer"
                               >
                                 <div className="w-full h-full rounded-full bg-[#14213D] flex items-center justify-center text-white font-extrabold text-3xl">
-                                  {otherProfile?.username?.charAt(0).toUpperCase() || <User size={32} />}
+                                  {(primaryRemoteProfile || otherProfile)?.username?.charAt(0).toUpperCase() || <User size={32} />}
                                 </div>
                               </div>
                               <div className="text-center mt-3">
-                                <p className="text-sm font-bold text-white">{otherProfile?.username || 'Stranger'}</p>
+                                <p className="text-sm font-bold text-white">{(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}</p>
                               </div>
                             </div>
                           )}
                           <div
                             onClick={() => {
-                              setInspectingUser({ uid: otherUid, profile: otherProfile });
-                              setProfileModalOpen(true);
+                              if (primaryRemoteProfile || otherProfile) {
+                                setInspectingUser({ uid: primaryRemoteUid || otherUid, profile: primaryRemoteProfile || otherProfile });
+                                setProfileModalOpen(true);
+                              }
                             }}
                             className="absolute top-4 left-4 z-20 bg-black/60 hover:bg-black/80 backdrop-blur-md px-3.5 py-1.5 rounded-full text-xs font-semibold text-white/95 border border-white/10 shadow-lg flex items-center gap-2 cursor-pointer transition group"
                             title="Click to inspect Profile"
                           >
                             <span className="group-hover:text-[#FCA311] transition">
-                              {otherProfile?.username || 'Stranger'}
+                              {(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}
                             </span>
                             <ShieldCheck size={13} className="text-emerald-400 shrink-0" />
-                            {isRemoteSpeaking && (
+                            {isPrimaryRemoteSpeaking && (
                               <span className="flex items-center gap-1 text-amber-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
                                 <Mic size={11} /> Speaking
                               </span>
@@ -2120,16 +2337,16 @@ function CallRoomInner() {
               </div>
             )}
 
-            {/* 2. DYNAMIC CSS AUTO-GRID MODE (1 to 6 Peers with Framer Motion Physics) */}
+            {/* 2. DISCORD AUTO-PACKING GRID MODE (1 to 5 Peers with Dynamic Sizing & Spring Physics) */}
             {layoutMode === 'grid' && !screenSharing && (
               <div className={getGridContainerClass()}>
-                {/* ── CARD 1: Local User Card ── */}
+                {/* ── CARD 0: Local User Card ── */}
                 <motion.div
                   layout
                   layoutId="local-video-card"
                   transition={springTransition}
                   className={`rounded-3xl bg-[#111318] border overflow-hidden shadow-2xl relative flex items-center justify-center transition-all duration-300 ${
-                    totalActivePeers === 1 ? 'w-full max-w-4xl aspect-video mx-auto' : 'w-full h-full min-h-0'
+                    totalActivePeers === 1 ? 'w-full max-w-4xl aspect-video mx-auto' : getCardSpanClass(0, totalActivePeers)
                   } ${getSpeakerBorderClass(isLocalSpeaking)}`}
                 >
                   <video
@@ -2193,123 +2410,289 @@ function CallRoomInner() {
                   )}
                 </motion.div>
 
-                {/* ── CARD 2: Remote Partner Card (when 2+ peers) ── */}
-                {totalActivePeers >= 2 && (
-                  <motion.div
-                    layout
-                    layoutId="remote-video-card"
-                    transition={springTransition}
-                    className={`rounded-3xl bg-[#111318] border overflow-hidden shadow-2xl relative flex items-center justify-center transition-all duration-300 w-full h-full min-h-0 ${getSpeakerBorderClass(isRemoteSpeaking)}`}
-                  >
-                    <video
-                      ref={remoteVideoRef}
-                      autoPlay
-                      playsInline
-                      className={`w-full h-full object-cover ${isRemoteConnected && isRemoteVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
-                    />
+                {/* ── REMOTE CARDS (1 to 4 Remote Peers with Per-Card Context Menu) ── */}
+                {remotePeerUids.map((pUid, idx) => {
+                  const peerIndex = idx + 1;
+                  const peerProf = participantProfiles[pUid] || (pUid === otherUid ? otherProfile : null);
+                  const peerStream = remoteStreams[pUid] || remoteStreamsRef.current[pUid];
+                  const isPeerVideoActive = Boolean(
+                    peerStream &&
+                    (peerStream.getVideoTracks?.()?.length || 0) > 0 &&
+                    peerStream.getVideoTracks()[0]?.enabled !== false
+                  );
+                  const peerVol = remoteVolumes[pUid] || 0;
+                  const isPeerSpeaking = peerVol > 15;
+                  const isWaitingPartner = pUid === 'waiting_partner';
 
-                    {/* Fallback avatar overlay if remote camera is disabled or connecting */}
-                    {(!isRemoteConnected || !isRemoteVideoActive) && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4">
-                        <div
-                          onClick={() => {
-                            if (otherUid && otherProfile) {
-                              setInspectingUser({ uid: otherUid, profile: otherProfile });
-                              setProfileModalOpen(true);
+                  return (
+                    <motion.div
+                      key={pUid || idx}
+                      layout
+                      layoutId={`remote-video-card-${pUid || idx}`}
+                      transition={springTransition}
+                      className={`rounded-3xl bg-[#111318] border overflow-hidden shadow-2xl relative flex items-center justify-center transition-all duration-300 ${getCardSpanClass(
+                        peerIndex,
+                        totalActivePeers
+                      )} ${getSpeakerBorderClass(isPeerSpeaking)}`}
+                    >
+                      {/* Video element with reactive volume, mute, and stream binding */}
+                      <video
+                        ref={(el) => {
+                          if (el) {
+                            if (peerStream && el.srcObject !== peerStream) {
+                              el.srcObject = peerStream;
                             }
-                          }}
-                          className={`w-24 h-24 rounded-full bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-600 p-[3px] shadow-[0_0_30px_rgba(252,163,17,0.35)] ${
-                            otherProfile ? 'cursor-pointer hover:scale-105 active:scale-95 transition' : ''
-                          }`}
-                        >
-                          <div className="w-full h-full rounded-full bg-[#14213D] flex items-center justify-center text-white font-extrabold text-3xl">
-                            {otherProfile?.username?.charAt(0).toUpperCase() || <User size={32} />}
-                          </div>
-                        </div>
-                        <div className="text-center space-y-1">
-                          <p className="text-sm font-bold text-white">
-                            {otherProfile?.username || (isSearchingNext ? 'Finding Partner...' : 'Stranger')}
-                          </p>
-                          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-mono text-amber-300">
-                            <span className="w-2 h-2 rounded-full bg-[#FCA311] animate-ping" />
-                            <span>
-                              {isSearchingNext
-                                ? 'Finding next stranger...'
-                                : isRemoteConnected
-                                ? 'Camera Off'
-                                : 'Connecting to partner...'}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Top-Left Clickable Name Badge */}
-                    {otherProfile && (
-                      <div
-                        onClick={() => {
-                          setInspectingUser({ uid: otherUid, profile: otherProfile });
-                          setProfileModalOpen(true);
+                            const isMuted = userMutedForMe[pUid] || false;
+                            const volMultiplier = (userVolumeOverrides[pUid] ?? 100) / 100;
+                            el.muted = isMuted;
+                            el.volume = Math.max(0, Math.min(1, volMultiplier)) * (isMuted ? 0 : 1);
+                            el.play().catch(() => {});
+                          }
                         }}
-                        className="absolute top-4 left-4 z-20 bg-black/60 hover:bg-black/80 backdrop-blur-md px-3.5 py-1.5 rounded-full text-xs font-semibold text-white/95 border border-white/10 shadow-lg flex items-center gap-2 cursor-pointer transition group"
-                        title="Click to inspect Profile"
-                      >
-                        <span className="group-hover:text-[#FCA311] transition">
-                          {otherProfile?.username || 'Stranger'}
-                        </span>
-                        <ShieldCheck size={13} className="text-emerald-400 shrink-0" />
-                        {isRemoteSpeaking && (
-                          <span className="flex items-center gap-1 text-amber-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
-                            <Mic size={11} /> Speaking
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </motion.div>
-                )}
+                        autoPlay
+                        playsInline
+                        className={`w-full h-full object-cover ${
+                          isPeerVideoActive ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'
+                        }`}
+                      />
 
-                {/* ── CARD 3: Third Peer Card (Max 3 per SPEC-003) ── */}
-                {totalActivePeers >= 3 &&
-                  roomParticipants
-                    .filter((uid) => uid && uid !== user?.uid && uid !== otherUid)
-                    .slice(0, 4)
-                    .map((pUid, idx) => {
-                      const peerProf = participantProfiles[pUid];
-                      const peerName = peerProf?.username || `Participant ${idx + 3}`;
-                      return (
-                        <motion.div
-                          key={pUid || idx}
-                          layout
-                          layoutId={`extra-peer-${pUid || idx}`}
-                          transition={springTransition}
-                          className="rounded-3xl bg-[#111318] border border-white/10 overflow-hidden shadow-2xl relative flex flex-col items-center justify-center p-4 transition-all duration-300 w-full h-full min-h-0"
-                        >
+                      {/* Fallback avatar overlay when camera is off or connecting */}
+                      {!isPeerVideoActive && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4">
                           <div
                             onClick={() => {
-                              if (peerProf) {
+                              if (peerProf && !isWaitingPartner) {
                                 setInspectingUser({ uid: pUid, profile: peerProf });
                                 setProfileModalOpen(true);
                               }
                             }}
-                            className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 p-[3px] shadow-lg cursor-pointer hover:scale-105 active:scale-95 transition"
+                            className={`w-24 h-24 rounded-full bg-gradient-to-tr from-amber-500 via-orange-500 to-rose-600 p-[3px] shadow-[0_0_30px_rgba(252,163,17,0.35)] ${
+                              peerProf && !isWaitingPartner ? 'cursor-pointer hover:scale-105 active:scale-95 transition' : ''
+                            }`}
                           >
-                            <div className="w-full h-full rounded-full bg-[#14213D] flex items-center justify-center text-white font-extrabold text-2xl">
-                              {peerProf?.username?.charAt(0).toUpperCase() || <User size={24} />}
+                            <div className="w-full h-full rounded-full bg-[#14213D] flex items-center justify-center text-white font-extrabold text-3xl">
+                              {peerProf?.username?.charAt(0).toUpperCase() || <User size={32} />}
                             </div>
                           </div>
-                          <div className="text-center mt-3">
-                            <p className="text-sm font-bold text-white flex items-center justify-center gap-1">
-                              <span>{peerName}</span>
-                              <ShieldCheck size={13} className="text-emerald-400 shrink-0" />
+                          <div className="text-center space-y-1">
+                            <p className="text-sm font-bold text-white">
+                              {peerProf?.username || (isWaitingPartner ? (isSearchingNext ? 'Finding Partner...' : 'Stranger') : 'Stranger')}
                             </p>
-                            <span className="text-[11px] text-slate-400 font-mono">Connected</span>
+                            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-mono text-amber-300">
+                              <span className="w-2 h-2 rounded-full bg-[#FCA311] animate-ping" />
+                              <span>
+                                {isWaitingPartner
+                                  ? isSearchingNext
+                                    ? 'Finding next stranger...'
+                                    : 'Connecting to partner...'
+                                  : isPeerSpeaking
+                                  ? 'Speaking...'
+                                  : 'Camera Off'}
+                              </span>
+                            </div>
                           </div>
-                          <div className="absolute top-4 left-4 z-20 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-xs font-semibold text-white/95 border border-white/10 shadow-lg flex items-center gap-1.5">
-                            <span>{peerName}</span>
-                          </div>
-                        </motion.div>
-                      );
-                    })}
+                        </div>
+                      )}
+
+                      {/* Top-Left Clickable Name Badge */}
+                      <div
+                        onClick={() => {
+                          if (peerProf && !isWaitingPartner) {
+                            setInspectingUser({ uid: pUid, profile: peerProf });
+                            setProfileModalOpen(true);
+                          }
+                        }}
+                        className={`absolute top-4 left-4 z-20 bg-black/60 hover:bg-black/80 backdrop-blur-md px-3.5 py-1.5 rounded-full text-xs font-semibold text-white/95 border border-white/10 shadow-lg flex items-center gap-2 ${
+                          peerProf && !isWaitingPartner ? 'cursor-pointer transition group' : ''
+                        }`}
+                        title={peerProf && !isWaitingPartner ? 'Click to inspect Profile' : undefined}
+                      >
+                        <span className="group-hover:text-[#FCA311] transition truncate max-w-[120px]">
+                          {peerProf?.username || (isWaitingPartner ? 'Stranger' : `Peer ${peerIndex}`)}
+                        </span>
+                        {!isWaitingPartner && <ShieldCheck size={13} className="text-emerald-400 shrink-0" />}
+                        {isPeerSpeaking && (
+                          <span className="flex items-center gap-1 text-amber-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
+                            <Mic size={11} /> Speaking
+                          </span>
+                        )}
+                        {userMutedForMe[pUid] && (
+                          <span className="flex items-center gap-1 text-red-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
+                            <VolumeX size={11} /> Muted
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Top-Right Discord-Style Per-Card Context Menu (...) */}
+                      {!isWaitingPartner && (
+                        <div className="absolute top-4 right-4 z-30">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setCardMenuOpenUid((prev) => (prev === pUid ? null : pUid));
+                            }}
+                            className="p-1.5 sm:p-2 rounded-full bg-black/60 hover:bg-black/80 backdrop-blur-md border border-white/10 text-white/80 hover:text-white transition shadow-lg cursor-pointer"
+                            title="Peer Options"
+                          >
+                            <MoreHorizontal size={16} />
+                          </button>
+
+                          {/* Dropdown Menu */}
+                          {cardMenuOpenUid === pUid && (
+                            <>
+                              <div
+                                className="fixed inset-0 z-30"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCardMenuOpenUid(null);
+                                }}
+                              />
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="absolute right-0 mt-2 w-56 rounded-2xl bg-[#121620]/95 backdrop-blur-xl border border-white/15 p-3 shadow-2xl space-y-2.5 animate-scale-pop z-40 text-left font-sans"
+                              >
+                              {/* Header */}
+                              <div className="flex items-center gap-2 pb-2 border-b border-white/10">
+                                <div className="w-8 h-8 rounded-full bg-[#14213D] border border-amber-500/30 flex items-center justify-center font-bold text-amber-400 text-xs shrink-0">
+                                  {peerProf?.username?.charAt(0).toUpperCase() || <User size={12} />}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-bold text-white truncate">
+                                    {peerProf?.username || 'Stranger'}
+                                  </p>
+                                  <span className="text-[10px] text-emerald-400 font-mono">
+                                    {isPeerSpeaking ? '● Speaking' : '● Connected'}
+                                  </span>
+                                </div>
+                              </div>
+
+                              {/* View Profile */}
+                              <button
+                                onClick={() => {
+                                  setInspectingUser({ uid: pUid, profile: peerProf });
+                                  setProfileModalOpen(true);
+                                  setCardMenuOpenUid(null);
+                                }}
+                                className="w-full px-2.5 py-1.5 rounded-xl hover:bg-white/10 text-xs font-semibold text-slate-200 flex items-center gap-2 transition cursor-pointer"
+                              >
+                                <User size={14} className="text-amber-400" />
+                                <span>View Profile</span>
+                              </button>
+
+                              {/* Direct Message / Chat */}
+                              <button
+                                onClick={() => {
+                                  setChatOpen(true);
+                                  setCardMenuOpenUid(null);
+                                }}
+                                className="w-full px-2.5 py-1.5 rounded-xl hover:bg-white/10 text-xs font-semibold text-slate-200 flex items-center gap-2 transition cursor-pointer"
+                              >
+                                <MessageCircle size={14} className="text-blue-400" />
+                                <span>Open Chat</span>
+                              </button>
+
+                              {/* User Volume Slider (0% - 200%) */}
+                              <div className="px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/5 space-y-1">
+                                <div className="flex items-center justify-between text-[11px] font-semibold text-slate-300">
+                                  <span className="flex items-center gap-1.5">
+                                    {userMutedForMe[pUid] ? (
+                                      <VolumeX size={12} className="text-red-400" />
+                                    ) : (
+                                      <Volume2 size={12} className="text-amber-400" />
+                                    )}
+                                    Volume
+                                  </span>
+                                  <span className="font-mono text-amber-400">
+                                    {userMutedForMe[pUid] ? '0%' : `${userVolumeOverrides[pUid] ?? 100}%`}
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="200"
+                                  step="5"
+                                  value={userMutedForMe[pUid] ? 0 : (userVolumeOverrides[pUid] ?? 100)}
+                                  onChange={(e) => {
+                                    const val = Number(e.target.value);
+                                    setUserVolumeOverrides((prev) => ({ ...prev, [pUid]: val }));
+                                    if (val > 0 && userMutedForMe[pUid]) {
+                                      setUserMutedForMe((prev) => ({ ...prev, [pUid]: false }));
+                                    }
+                                  }}
+                                  className="w-full accent-amber-500 h-1 bg-white/10 rounded-lg cursor-pointer"
+                                />
+                              </div>
+
+                              {/* Mute for Me Toggle */}
+                              <button
+                                onClick={() => {
+                                  setUserMutedForMe((prev) => ({
+                                    ...prev,
+                                    [pUid]: !prev[pUid],
+                                  }));
+                                  setCardMenuOpenUid(null);
+                                }}
+                                className={`w-full px-2.5 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
+                                  userMutedForMe[pUid]
+                                    ? 'bg-red-500/20 text-red-300 hover:bg-red-500/30'
+                                    : 'hover:bg-white/10 text-slate-200'
+                                }`}
+                              >
+                                {userMutedForMe[pUid] ? <VolumeX size={14} /> : <Volume2 size={14} />}
+                                <span>{userMutedForMe[pUid] ? 'Unmute for Me' : 'Mute for Me'}</span>
+                              </button>
+
+                              {/* Friend Request Button */}
+                              {friendStatuses[pUid] === 'friends' ? (
+                                <div className="w-full px-2.5 py-1.5 rounded-xl bg-emerald-500/10 text-emerald-400 text-xs font-semibold flex items-center gap-2">
+                                  <Check size={14} />
+                                  <span>Friends</span>
+                                </div>
+                              ) : friendStatuses[pUid] === 'pending' ? (
+                                <div className="w-full px-2.5 py-1.5 rounded-xl bg-amber-500/10 text-amber-300 text-xs font-semibold flex items-center gap-2">
+                                  <Clock size={14} />
+                                  <span>Request Sent</span>
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={async () => {
+                                    if (user?.uid) {
+                                      await sendFriendRequest({
+                                        fromUid: user.uid,
+                                        fromUsername: profile?.username || 'Stranger',
+                                        toUid: pUid,
+                                      });
+                                      setFriendStatuses((prev) => ({ ...prev, [pUid]: 'pending' }));
+                                      setCardMenuOpenUid(null);
+                                    }
+                                  }}
+                                  className="w-full px-2.5 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-xs font-semibold flex items-center gap-2 transition cursor-pointer"
+                                >
+                                  <UserPlus size={14} />
+                                  <span>Add Friend</span>
+                                </button>
+                              )}
+
+                              {/* Report / Block */}
+                              <button
+                                onClick={() => {
+                                  setInspectingUser({ uid: pUid, profile: peerProf });
+                                  setReportOpen(true);
+                                  setCardMenuOpenUid(null);
+                                }}
+                                className="w-full px-2.5 py-1.5 rounded-xl hover:bg-red-500/20 text-xs font-semibold text-red-400 flex items-center gap-2 transition cursor-pointer"
+                              >
+                                <Flag size={14} />
+                                <span>Report / Block</span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        </div>
+                      )}
+                    </motion.div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -2745,7 +3128,7 @@ function CallRoomInner() {
         />
       )}
 
-      {/* ── SPEC-003: Room Full Modal ──────────────────────────────────── */}
+      {/* ── SPEC-005: Room Full (5/5) Modal ───────────────────────────── */}
       {roomFullBlocked && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 animate-fade-in font-sans">
           <motion.div
@@ -2758,9 +3141,9 @@ function CallRoomInner() {
               <Users size={28} />
             </div>
             <div className="space-y-2">
-              <h3 className="text-xl font-extrabold text-white">Room is Full (3/3)</h3>
+              <h3 className="text-xl font-extrabold text-white">Room is Full (5/5)</h3>
               <p className="text-xs text-slate-300 leading-relaxed">
-                This conversation has reached its maximum capacity of 3 participants.
+                This conversation has reached its maximum capacity of 5 participants.
               </p>
             </div>
             <button
