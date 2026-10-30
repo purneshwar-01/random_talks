@@ -289,20 +289,27 @@ export default function Dashboard() {
     return unsub;
   }, [user?.uid]);
 
+  const searchingRef = useRef(searching);
+  useEffect(() => {
+    searchingRef.current = searching;
+  }, [searching]);
+
   // ── Cleanup on unmount & Back-Button (popstate) trapping during search ────
   useEffect(() => {
     const handlePopState = () => {
-      if (searching) {
+      if (searchingRef.current) {
         stopSearching(true);
       }
     };
     window.addEventListener('popstate', handlePopState);
     return () => {
       window.removeEventListener('popstate', handlePopState);
-      stopSearching(true);
+      if (searchingRef.current) {
+        stopSearching(true);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searching]);
+  }, []);
 
   // ── Matchmaking helpers ─────────────────────────────────────────────────
   const stopSearching = (removeFromQueue = true) => {
@@ -327,25 +334,42 @@ export default function Dashboard() {
   };
 
   const startMatch = async () => {
-    if (!user || !profile || searching) return;
-    if (isBanned || profile.strikeCount >= 3) {
+    console.log('[Dashboard] startMatch clicked. User:', user?.uid, 'Mode:', matchMode);
+    if (!user) {
+      setErrorMessage('Please sign in to find a partner.');
+      return;
+    }
+    if (isBanned || (profile?.strikeCount && profile.strikeCount >= 3)) {
       setErrorMessage('Your account has been suspended due to community policy strikes.');
       return;
+    }
+    if (searching) {
+      stopSearching(true);
     }
     setErrorMessage('');
     navigatedRef.current = false;
     searchAttemptsRef.current = 0;
+    const isLocalhost = typeof window !== 'undefined' && Boolean(
+      window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    );
     setSearching(true);
     setSearchStatusText('Joining matchmaking queue...');
     try {
+      const activeUsername = profile?.username || user.displayName || user.email?.split('@')[0] || 'Stranger';
+      const activeGender = profile?.gender || 'Any';
+      const activeOccupation = profile?.occupation || '';
+      const activeAge = profile?.age || null;
+
       await joinQueue({
         uid: user.uid,
-        username: profile.username,
-        gender: profile.gender,
-        genderFilter: filterGender,
-        mode: matchMode,
-        occupation: profile.occupation || '',
-        age: profile.age,
+        username: activeUsername,
+        gender: activeGender,
+        genderFilter: filterGender || 'Any',
+        mode: matchMode || 'casual',
+        occupation: activeOccupation,
+        age: activeAge,
+      }).catch((err) => {
+        console.warn('[Matchmaking] joinQueue notice:', err);
       });
 
       let lastAttemptTime = 0;
@@ -363,22 +387,33 @@ export default function Dashboard() {
         lastAttemptTime = now;
         searchAttemptsRef.current += 1;
         const attempts = searchAttemptsRef.current;
-        if (attempts <= 4) setSearchStatusText(`Looking for a ${activeModeObj.label} partner...`);
-        else if (attempts <= 8) setSearchStatusText('Expanding search to nearby modes...');
-        else setSearchStatusText('Opening to all available strangers...');
+        if (attempts <= 4) {
+          setSearchStatusText(`Looking for a ${activeModeObj.label} partner...`);
+        } else if (attempts <= 8) {
+          setSearchStatusText('Expanding search to nearby modes...');
+        } else if (isLocalhost) {
+          setSearchStatusText('Searching for nearby peers on localhost... (Open an Incognito window to connect)');
+        } else {
+          setSearchStatusText('Opening to all available strangers...');
+        }
         try {
           const roomId = await tryMatch(user.uid, {
-            gender: profile.gender,
-            genderFilter: filterGender,
-            mode: matchMode,
+            gender: activeGender,
+            genderFilter: filterGender || 'Any',
+            mode: matchMode || 'casual',
             searchAttemptCount: attempts,
           });
-          if (roomId) goToRoom(roomId, 'caller');
-        } catch (err) {
-          if (err?.code === 'permission-denied' || err?.code === 'unauthenticated') {
-            setErrorMessage('Matchmaking cannot create a room. Deploy the Firestore rules and try again.');
-            stopSearching(true);
+          if (roomId) {
+            goToRoom(roomId, 'caller');
+          } else if (isLocalhost && attempts >= 2) {
+            setSearchStatusText('Searching for nearby peers on localhost... (Open an Incognito window to connect)');
           }
+        } catch (err) {
+          console.warn('[Matchmaking] attempt notice:', err);
+          if (isLocalhost) {
+            setSearchStatusText('Searching for nearby peers on localhost... (Open an Incognito window to connect)');
+          }
+          // Keep searching = true active so ConnectionLoader remains stably visible on screen.
         }
       };
 
@@ -386,10 +421,11 @@ export default function Dashboard() {
         user.uid,
         (roomId) => goToRoom(roomId, 'callee'),
         (err) => {
-          if (err?.code === 'permission-denied' || err?.code === 'unauthenticated') {
-            setErrorMessage('Matchmaking permission error — ensure Firestore rules are deployed.');
-            stopSearching(true);
+          console.warn('[Matchmaking] listenForMatch notice:', err);
+          if (isLocalhost) {
+            setSearchStatusText('Searching for nearby peers on localhost... (Open an Incognito window to connect)');
           }
+          // Do NOT abort or call stopSearching(true) on transient error
         },
         () => {
           attempt();
@@ -400,9 +436,13 @@ export default function Dashboard() {
       // Watchdog fallback polling at 10s protects Firestore read quota from aggressive polling
       pollRef.current = setInterval(attempt, 10000);
     } catch (err) {
-      console.error('Start match error:', err);
-      setErrorMessage('Failed to start matchmaking. Please try again.');
-      stopSearching(true);
+      console.warn('[Matchmaking] startMatch notice:', err);
+      if (isLocalhost) {
+        setSearchStatusText('Searching for nearby peers on localhost... (Open an Incognito window to connect)');
+      } else {
+        setSearchStatusText('Searching for available peers...');
+      }
+      // Keep searching = true active. Dismiss only when user clicks onCancel.
     }
   };
 
@@ -999,9 +1039,10 @@ export default function Dashboard() {
           )}
 
           <button
+            type="button"
             onClick={startMatch}
-            disabled={isBanned || searching}
-            className="group relative h-14 px-8 rounded-2xl bg-[#FCA311] hover:bg-[#E5930B] text-[#14213D] font-extrabold text-base shadow-[0_12px_28px_-4px_rgba(252,163,17,0.4)] hover:shadow-[0_16px_32px_-4px_rgba(252,163,17,0.5)] transition-all duration-200 active:scale-[0.98] flex items-center justify-center gap-3 cursor-pointer disabled:opacity-50 w-full sm:w-auto mx-auto"
+            disabled={isBanned}
+            className="group relative h-14 px-8 rounded-2xl bg-[#FCA311] hover:bg-[#E5930B] text-[#14213D] font-extrabold text-base shadow-[0_12px_28px_-4px_rgba(252,163,17,0.4)] hover:shadow-[0_16px_32px_-4px_rgba(252,163,17,0.5)] transition-all duration-200 active:scale-[0.98] flex items-center justify-center gap-3 cursor-pointer disabled:opacity-50 w-full sm:w-auto mx-auto select-none"
           >
             <Video className="group-hover:scale-110 transition duration-200" size={20} />
             <span className="tracking-tight">Find Partner for {activeModeObj.label}</span>

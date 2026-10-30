@@ -105,8 +105,8 @@ export default function CallHistoryModal({ onClose }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 font-sans animate-fade-in">
-      <div className="bg-white border border-slate-200/90 rounded-3xl w-full max-w-xl shadow-2xl flex flex-col max-h-[85vh] relative overflow-hidden animate-scale-pop">
+    <div data-lenis-prevent className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 font-sans animate-fade-in">
+      <div data-lenis-prevent className="bg-white border border-slate-200/90 rounded-3xl w-full max-w-xl shadow-2xl flex flex-col max-h-[85vh] relative overflow-hidden animate-scale-pop">
         {/* Header */}
         <div className="flex items-center justify-between px-6 pt-6 pb-4 border-b border-slate-100">
           <div className="flex items-center gap-3">
@@ -127,7 +127,11 @@ export default function CallHistoryModal({ onClose }) {
         </div>
 
         {/* Content list */}
-        <div className="overflow-y-auto px-6 py-4 flex-1 space-y-3">
+        <div
+          data-lenis-prevent
+          className="overflow-y-auto px-6 py-4 flex-1 space-y-3 overscroll-contain"
+          style={{ overscrollBehavior: 'contain' }}
+        >
           {loading ? (
             <div className="flex flex-col items-center justify-center py-16 gap-3 text-slate-400">
               <Loader2 size={30} className="animate-spin text-[#FCA311]" />

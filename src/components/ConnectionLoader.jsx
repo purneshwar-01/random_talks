@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { generateMatchmakingTips, FALLBACK_TIPS } from '../lib/gemini';
 
@@ -71,8 +72,8 @@ export default function ConnectionLoader({
     return () => clearInterval(interval);
   }, [tips]);
 
-  return (
-    <div className="fixed inset-0 w-screen h-screen min-h-screen bg-black z-50 flex items-center justify-center select-none overflow-hidden animate-fade-in">
+  const overlay = (
+    <div className="fixed inset-0 w-screen h-screen min-h-screen bg-black z-[9999] flex items-center justify-center select-none overflow-hidden animate-fade-in">
       {/* ── Atmospheric Centerpiece Hands Visual (Responsively Scaled & Positioned for Mobile & Desktop) ── */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden z-10 -translate-y-12 sm:-translate-y-20 md:-translate-y-24">
         <img
@@ -125,4 +126,10 @@ export default function ConnectionLoader({
       )}
     </div>
   );
+
+  if (typeof document !== 'undefined' && document.body) {
+    return createPortal(overlay, document.body);
+  }
+
+  return overlay;
 }

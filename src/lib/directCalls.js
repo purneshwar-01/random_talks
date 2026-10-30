@@ -7,15 +7,16 @@ import {
   serverTimestamp,
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
+import { generateOpaqueRoomToken } from './matchmaking';
 
 const INVITES = 'callInvites';
 
 /**
  * Caller: write a call invite doc for the receiver.
- * roomId = [callerUid, receiverUid].sort().join('_direct_')
+ * Uses opaque room token to prevent leaking user UIDs in browser history and signaling URLs.
  */
 export async function sendCallInvite({ callerUid, callerName, receiverUid }) {
-  const roomId = [callerUid, receiverUid].sort().join('_direct_');
+  const roomId = `direct_${generateOpaqueRoomToken()}`;
   await setDoc(doc(db, INVITES, receiverUid), {
     callerUid,
     callerName: callerName || 'Friend',

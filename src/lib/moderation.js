@@ -5,6 +5,8 @@ import {
   deleteDoc,
   getDoc,
   getDocs,
+  updateDoc,
+  increment,
   query,
   where,
   serverTimestamp,
@@ -128,5 +130,21 @@ export async function submitPostChatFeedback({ fromUid, toUid, roomId, rating })
     console.info(`[Moderation] Feedback submitted for server-side processing: ${toUid}`);
   } catch (err) {
     console.error('[Moderation] Feedback submit error:', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// upvoteUserKarma — atomically increment builder karma score
+// ---------------------------------------------------------------------------
+export async function upvoteUserKarma(targetUid, points = 5) {
+  if (!targetUid || points <= 0) return;
+  try {
+    const userRef = doc(db, USERS, targetUid);
+    await updateDoc(userRef, {
+      karmaScore: increment(points),
+    });
+    console.info(`[Moderation] Successfully awarded +${points} Karma to ${targetUid}`);
+  } catch (err) {
+    console.warn('[Moderation] upvoteUserKarma notice:', err);
   }
 }

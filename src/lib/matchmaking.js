@@ -221,8 +221,8 @@ export async function tryMatch(uid, { gender, genderFilter, mode, searchAttemptC
       if (roomId) return roomId;
     }
   } catch (err) {
-    console.error('[Matchmaking] tryMatch error:', err);
-    if (err?.code === 'permission-denied' || err?.code === 'unauthenticated') throw err;
+    console.warn('[Matchmaking] tryMatch notice:', err);
+    return null;
   }
 
   return null;

@@ -21,6 +21,7 @@ import {
   X,
   Check,
   ShieldCheck,
+  Shield,
   Zap,
   Clock,
   Lock,
@@ -45,6 +46,9 @@ import {
   Volume2,
   VolumeX,
   UserPlus,
+  Coffee,
+  BatteryCharging,
+  Bell,
 } from 'lucide-react';
 import {
   leaveQueue,
@@ -132,6 +136,28 @@ class CallRoomErrorBoundary extends Component {
     return this.props.children;
   }
 }
+
+// SPEC-008: 3 Preset options for The Silent Decline (Polite Exit)
+const POLITE_EXIT_OPTIONS = [
+  {
+    id: 'coffee',
+    icon: Coffee,
+    text: 'Quick Coffee Break',
+    subtext: 'Stepping away for a quick beverage, snack, or stretch.',
+  },
+  {
+    id: 'battery',
+    icon: BatteryCharging,
+    text: 'Connection/Battery Low',
+    subtext: 'Hardware battery is dipping low or network connection is unstable.',
+  },
+  {
+    id: 'urgent',
+    icon: Bell,
+    text: 'Urgent Doorbell/Call',
+    subtext: 'A real-world delivery, doorbell chime, or urgent phone call arrived.',
+  },
+];
 
 // Helper to extract the other peer's UID from roomId or participant array
 function parseOtherUid(roomId, myUid, fallbackParticipants = []) {
@@ -275,6 +301,11 @@ function CallRoomInner() {
   const [roomFullBlocked, setRoomFullBlocked] = useState(false);
   const [timeLeft, setTimeLeft] = useState(mode === 'quicktalk' ? QUICK_TALK_SECONDS : null);
   const [callError, setCallError] = useState('');
+
+  // SPEC-008: The Silent Decline (Polite Exit) & Peer Notice States
+  const [politeExitOpen, setPoliteExitOpen] = useState(false);
+  const [politeExitInfo, setPoliteExitInfo] = useState(null);
+  const [sentFriendRequestDuringExit, setSentFriendRequestDuringExit] = useState(false);
 
   // Hardware controls state — single-state camera pipeline (Law 12 compliant)
   const [micEnabled, setMicEnabled] = useState(true);
@@ -869,6 +900,35 @@ function CallRoomInner() {
     }
   }, [logCurrentCallHistory, stopMatchSearch, currentRoomId, teardownMediaTracks, isPrivateRoom, isSoloTest, otherUid, navigate]);
 
+  // ── SPEC-008: The Silent Decline / Polite Exit ──────────────────────────
+  const handlePoliteExit = useCallback(async (option) => {
+    setPoliteExitOpen(false);
+    isExplicitlyLeavingRef.current = true;
+    setStrangerLeftOpen(false);
+    setChatOpen(false);
+    try {
+      await updateDoc(doc(db, 'calls', currentRoomId), {
+        status: 'ended',
+        isEnded: true,
+        exitReason: {
+          senderUid: user.uid,
+          senderName: profile?.username || 'Stranger',
+          type: option.id,
+          text: option.text,
+          timestamp: Date.now(),
+        },
+        endedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      console.warn('[CallRoom] Polite exit signal notice:', err);
+      markCallEnded(currentRoomId).catch(() => {});
+    }
+    logCurrentCallHistory().catch(() => {});
+    stopMatchSearch();
+    teardownMediaTracks();
+    navigate('/dashboard');
+  }, [currentRoomId, user?.uid, profile?.username, logCurrentCallHistory, stopMatchSearch, teardownMediaTracks, navigate]);
+
   const handleRemotePartnerDisconnectedRef = useRef(handleRemotePartnerDisconnected);
   useEffect(() => {
     handleRemotePartnerDisconnectedRef.current = handleRemotePartnerDisconnected;
@@ -907,6 +967,11 @@ function CallRoomInner() {
         if (!snap.exists() || !callData) {
           // Waiting for caller to initialize the call document
           return;
+        }
+
+        // SPEC-008: Capture polite exit notice if emitted by remote partner
+        if (callData.exitReason && callData.exitReason.senderUid !== user.uid) {
+          setPoliteExitInfo(callData.exitReason);
         }
 
         // Check if call ended explicitly in Firestore
@@ -2211,6 +2276,10 @@ function CallRoomInner() {
                         className="absolute top-2 left-2 z-20 bg-black/60 hover:bg-black/80 backdrop-blur-md px-2 py-0.5 rounded-full text-[10px] font-semibold text-white/95 border border-white/10 flex items-center gap-1.5 cursor-pointer shadow"
                       >
                         <span className="truncate max-w-[80px]">{(primaryRemoteProfile || otherProfile)?.username || 'Stranger'}</span>
+                        <span className="inline-flex items-center gap-0.5 px-1 py-0.2 rounded-full bg-amber-500/20 text-[#FCA311] border border-amber-500/30 text-[9px] font-bold">
+                          <Shield size={9} className="text-amber-400 fill-amber-400/20" />
+                          <span>{(primaryRemoteProfile || otherProfile)?.karmaScore ?? 0}</span>
+                        </span>
                         <ShieldCheck size={11} className="text-emerald-400 shrink-0" />
                         {isPrimaryRemoteSpeaking && <Mic size={10} className="text-amber-400 animate-pulse" />}
                       </div>
@@ -2375,6 +2444,10 @@ function CallRoomInner() {
                   {/* Top-Left Name Badge & Mic status */}
                   <div className="absolute top-4 left-4 z-20 bg-black/60 backdrop-blur-md px-3.5 py-1.5 rounded-full text-xs font-semibold text-white/95 border border-white/10 shadow-lg flex items-center gap-2">
                     <span>{profile?.username || 'You'} (You)</span>
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/20 text-[#FCA311] border border-amber-500/30 text-[10px] font-bold">
+                      <Shield size={10} className="fill-amber-400/20 text-amber-400" />
+                      <span>{profile?.karmaScore ?? 0} Karma</span>
+                    </span>
                     {!micEnabled ? (
                       <span className="flex items-center gap-1 text-red-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
                         <MicOff size={11} /> Muted
@@ -2510,6 +2583,12 @@ function CallRoomInner() {
                         <span className="group-hover:text-[#FCA311] transition truncate max-w-[120px]">
                           {peerProf?.username || (isWaitingPartner ? 'Stranger' : `Peer ${peerIndex}`)}
                         </span>
+                        {!isWaitingPartner && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-500/20 text-[#FCA311] border border-amber-500/30 text-[10px] font-bold">
+                            <Shield size={10} className="fill-amber-400/20 text-amber-400 shrink-0" />
+                            <span>{peerProf?.karmaScore ?? 0} Karma</span>
+                          </span>
+                        )}
                         {!isWaitingPartner && <ShieldCheck size={13} className="text-emerald-400 shrink-0" />}
                         {isPeerSpeaking && (
                           <span className="flex items-center gap-1 text-amber-400 text-[11px] font-bold border-l border-white/15 pl-1.5">
@@ -2708,26 +2787,88 @@ function CallRoomInner() {
         </div>
       )}
 
-      {/* ── Stranger Left Modal (Case B: 3 clean actions) ──────────────── */}
+      {/* ── Stranger Left Modal / Polite Exit Notice (Case B: 3 clean actions) ──────────────── */}
       {strangerLeftOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 animate-fade-in font-sans">
-          <div className="bg-stone-900 border border-white/15 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl text-center space-y-5 animate-scale-pop">
+          <div className="bg-stone-900 border border-white/15 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl text-center space-y-5 animate-scale-pop text-white">
             <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-[#FCA311] flex items-center justify-center mx-auto shadow-inner">
-              <PhoneOff size={28} />
+              {politeExitInfo?.type === 'coffee' ? (
+                <Coffee size={28} />
+              ) : politeExitInfo?.type === 'battery' ? (
+                <BatteryCharging size={28} />
+              ) : politeExitInfo?.type === 'urgent' ? (
+                <Bell size={28} />
+              ) : (
+                <PhoneOff size={28} />
+              )}
             </div>
 
             <div className="space-y-1.5">
-              <h3 className="text-xl font-extrabold text-white">Stranger Left the Conversation</h3>
-              <p className="text-xs text-slate-300">
-                Your conversation partner has disconnected. What would you like to do?
-              </p>
+              <h3 className="text-xl font-extrabold text-white">
+                {politeExitInfo
+                  ? `${politeExitInfo.senderName} Took a Polite Exit`
+                  : 'Stranger Left the Conversation'}
+              </h3>
+              {politeExitInfo ? (
+                <div className="space-y-2">
+                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-bold">
+                    <span>{politeExitInfo.text}</span>
+                  </div>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Your partner gracefully stepped away. Send a friend request to stay connected and chat again anytime!
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-300">
+                  Your conversation partner has disconnected. What would you like to do?
+                </p>
+              )}
             </div>
 
             <div className="flex flex-col gap-2.5 pt-2">
+              {/* 1-Click Add Friend CTA on Polite Exit */}
+              {politeExitInfo && (
+                <button
+                  type="button"
+                  disabled={sentFriendRequestDuringExit}
+                  onClick={async () => {
+                    const targetId = politeExitInfo.senderUid || otherUid || otherUidRef.current;
+                    if (!targetId || !user) return;
+                    try {
+                      await sendFriendRequest({
+                        fromUid: user.uid,
+                        fromUsername: profile?.username || 'Stranger',
+                        toUid: targetId,
+                      });
+                      setSentFriendRequestDuringExit(true);
+                    } catch (err) {
+                      console.warn('Friend request error on exit:', err);
+                    }
+                  }}
+                  className={`w-full py-3 px-4 rounded-xl text-xs font-black transition flex items-center justify-center gap-2 active:scale-95 shadow-md ${
+                    sentFriendRequestDuringExit
+                      ? 'bg-emerald-600 text-white cursor-default'
+                      : 'bg-emerald-500 hover:bg-emerald-600 text-white cursor-pointer'
+                  }`}
+                >
+                  {sentFriendRequestDuringExit ? (
+                    <>
+                      <Check size={16} /> Friend Request Sent!
+                    </>
+                  ) : (
+                    <>
+                      <UserPlus size={16} /> Add {politeExitInfo.senderName} as Friend
+                    </>
+                  )}
+                </button>
+              )}
+
               {/* 1. Primary CTA: Find Next Stranger */}
               <button
                 onClick={() => {
                   setStrangerLeftOpen(false);
+                  setPoliteExitInfo(null);
+                  setSentFriendRequestDuringExit(false);
                   handleNextStranger();
                 }}
                 className="w-full py-3 px-4 rounded-xl bg-[#FCA311] hover:bg-[#E5930B] text-[#14213D] text-sm font-black shadow-[0_4px_20px_rgba(252,163,17,0.35)] transition flex items-center justify-center gap-2 cursor-pointer active:scale-95"
@@ -2740,6 +2881,8 @@ function CallRoomInner() {
                 <button
                   onClick={() => {
                     setStrangerLeftOpen(false);
+                    setPoliteExitInfo(null);
+                    setSentFriendRequestDuringExit(false);
                     setReportOpen(true);
                   }}
                   className="flex-1 py-2.5 px-3 rounded-xl bg-white/10 hover:bg-red-500/20 text-slate-200 hover:text-red-400 border border-white/10 hover:border-red-500/30 text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
@@ -2751,6 +2894,8 @@ function CallRoomInner() {
                 <button
                   onClick={() => {
                     setStrangerLeftOpen(false);
+                    setPoliteExitInfo(null);
+                    setSentFriendRequestDuringExit(false);
                     teardownMediaTracks();
                     navigate('/dashboard');
                   }}
@@ -2878,6 +3023,16 @@ function CallRoomInner() {
               <div className="h-6 w-px bg-white/15" />
 
               <button
+                type="button"
+                onClick={() => setPoliteExitOpen(true)}
+                className="h-10 px-3.5 sm:px-4 rounded-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 font-bold text-xs flex items-center gap-1.5 transition active:scale-95 whitespace-nowrap cursor-pointer shadow-md"
+                title="The Silent Decline (Polite Exit)"
+              >
+                <Coffee size={16} className="text-[#FCA311]" />
+                <span className="hidden sm:inline">Polite Exit</span>
+              </button>
+
+              <button
                 onClick={leaveCallExplicit}
                 className="p-2.5 sm:p-3 rounded-full bg-red-600 hover:bg-red-700 text-white transition flex items-center justify-center shadow-lg active:scale-95 cursor-pointer"
                 title="Leave Room"
@@ -2998,6 +3153,17 @@ function CallRoomInner() {
               >
                 <Zap size={14} className="fill-current" />
                 <span className="hidden sm:inline">Next Stranger</span>
+              </button>
+
+              {/* [Polite Exit] */}
+              <button
+                type="button"
+                onClick={() => setPoliteExitOpen(true)}
+                className="h-10 px-3.5 sm:px-4 rounded-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 font-bold text-xs flex items-center gap-1.5 transition active:scale-95 whitespace-nowrap cursor-pointer shadow-md"
+                title="The Silent Decline (Polite Exit)"
+              >
+                <Coffee size={16} className="text-[#FCA311]" />
+                <span className="hidden sm:inline">Polite Exit</span>
               </button>
 
               {/* [Leave Call] (ONLY single red circular button at far right) */}
@@ -3156,6 +3322,85 @@ function CallRoomInner() {
               <Rocket size={14} /> Start Your Own Conversation
             </button>
           </motion.div>
+        </div>
+      )}
+
+      {/* ── SPEC-008: The Silent Decline / Polite Exit Glassmorphic Sheet ─ */}
+      {politeExitOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-md p-3 sm:p-4 animate-fade-in font-sans"
+          onClick={() => setPoliteExitOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg bg-[#141824]/95 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 sm:p-7 shadow-2xl space-y-5 animate-slide-up text-white"
+          >
+            {/* Header */}
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-500/20 border border-amber-500/30 text-[#FCA311] flex items-center justify-center shadow-inner">
+                  <Coffee size={20} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-black text-white">The Silent Decline</h3>
+                  <p className="text-xs text-slate-400 font-medium">
+                    Exit gracefully with a polite preset. Zero awkwardness.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setPoliteExitOpen(false)}
+                className="p-1.5 rounded-full hover:bg-white/10 text-slate-400 hover:text-white transition cursor-pointer"
+                aria-label="Close polite exit sheet"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* 3 Preset Options */}
+            <div className="grid grid-cols-1 gap-2.5">
+              {POLITE_EXIT_OPTIONS.map((opt) => {
+                const Icon = opt.icon;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => handlePoliteExit(opt)}
+                    className="w-full p-4 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/10 hover:border-amber-500/40 transition-all flex items-center gap-3.5 text-left group cursor-pointer active:scale-98"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/20 text-[#FCA311] flex items-center justify-center shrink-0 group-hover:scale-105 group-hover:bg-[#FCA311] group-hover:text-[#14213D] transition">
+                      <Icon size={18} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-bold text-white group-hover:text-[#FCA311] transition">
+                          {opt.text}
+                        </h4>
+                        <span className="text-[10px] text-amber-400 font-mono font-semibold">Select ➜</span>
+                      </div>
+                      <p className="text-xs text-slate-400 font-normal mt-0.5 leading-relaxed">
+                        {opt.subtext}
+                      </p>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Bottom Dismiss / Cancel */}
+            <div className="pt-2 border-t border-white/10 flex items-center justify-between">
+              <span className="text-[11px] text-slate-400">
+                Notice will display to partner with instant Add Friend option.
+              </span>
+              <button
+                type="button"
+                onClick={() => setPoliteExitOpen(false)}
+                className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-bold text-white transition cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

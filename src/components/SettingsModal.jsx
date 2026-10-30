@@ -83,8 +83,8 @@ export default function SettingsModal({ onClose }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 font-sans">
-      <div className="bg-white border border-slate-200/90 rounded-3xl w-full max-w-lg shadow-2xl flex flex-col max-h-[90vh] relative overflow-hidden animate-scale-pop">
+    <div data-lenis-prevent className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 font-sans">
+      <div data-lenis-prevent className="bg-white border border-slate-200/90 rounded-3xl w-full max-w-lg shadow-2xl flex flex-col max-h-[90vh] relative overflow-hidden animate-scale-pop">
         {/* Header */}
         <div className="flex items-center justify-between px-6 pt-6 pb-4 border-b border-slate-100">
           <div>
@@ -100,7 +100,12 @@ export default function SettingsModal({ onClose }) {
         </div>
 
         {/* Scrollable form body */}
-        <form onSubmit={handleSave} className="overflow-y-auto px-6 py-5 space-y-4 flex-1">
+        <form
+          onSubmit={handleSave}
+          data-lenis-prevent
+          className="overflow-y-auto px-6 py-5 space-y-4 flex-1 overscroll-contain"
+          style={{ overscrollBehavior: 'contain' }}
+        >
           {/* Email — read-only */}
           <div>
             <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5 mb-1.5">

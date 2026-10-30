@@ -37,6 +37,8 @@ export default function PrivateRoomModal({ user, onClose }) {
         participants: [user.uid],
         isPrivate: true,
         code,
+        status: 'active',
+        isEnded: false,
         createdBy: user.uid,
         createdAt: serverTimestamp(),
       });

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   X,
   ShieldCheck,
+  Shield,
   Briefcase,
   Globe,
   Languages,
@@ -110,10 +111,14 @@ export default function FriendProfileModal({
           ) : (
             <>
               <div>
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
                   <h3 className="text-xl font-extrabold text-slate-900 truncate">
                     {profile?.username || 'Stranger'}
                   </h3>
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-900 border border-amber-200/80 text-[11px] font-black shadow-2xs">
+                    <Shield size={12} className="text-[#FCA311] fill-amber-400/20 shrink-0" />
+                    <span>{profile?.karmaScore ?? 0} Karma</span>
+                  </span>
                   <ShieldCheck size={18} className="text-emerald-600 shrink-0" title="Verified Member" />
                 </div>
                 <p className="text-sm font-medium text-slate-600 flex items-center gap-1.5 mt-0.5">
@@ -123,29 +128,35 @@ export default function FriendProfileModal({
               </div>
 
               {/* Badges / Stats */}
-              <div className="grid grid-cols-2 gap-2.5">
-                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3 flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 font-bold text-xs">
-                    <Award size={16} />
+              <div className="grid grid-cols-3 gap-2">
+                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-2.5 flex flex-col items-center text-center">
+                  <div className="w-7 h-7 rounded-lg bg-amber-100 text-amber-800 flex items-center justify-center shrink-0 mb-1">
+                    <Shield size={14} className="text-amber-600 fill-amber-500/20" />
                   </div>
-                  <div>
-                    <p className="text-[10px] uppercase font-bold text-slate-400">Trust Score</p>
-                    <p className="text-xs font-extrabold text-emerald-700">
-                      {profile?.trustScore ?? 100}% Rating
-                    </p>
-                  </div>
+                  <p className="text-[9px] uppercase font-bold text-slate-400">Builder Karma</p>
+                  <p className="text-xs font-black text-amber-600">
+                    {profile?.karmaScore ?? 0} pts
+                  </p>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3 flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0 font-bold text-xs">
-                    <Globe size={16} />
+                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-2.5 flex flex-col items-center text-center">
+                  <div className="w-7 h-7 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mb-1">
+                    <Award size={14} />
                   </div>
-                  <div>
-                    <p className="text-[10px] uppercase font-bold text-slate-400">Location</p>
-                    <p className="text-xs font-extrabold text-slate-800 truncate">
-                      {profile?.country || 'Global'}
-                    </p>
+                  <p className="text-[9px] uppercase font-bold text-slate-400">Trust Score</p>
+                  <p className="text-xs font-black text-emerald-700">
+                    {profile?.trustScore ?? 100}%
+                  </p>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-2.5 flex flex-col items-center text-center">
+                  <div className="w-7 h-7 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center shrink-0 mb-1">
+                    <Globe size={14} />
                   </div>
+                  <p className="text-[9px] uppercase font-bold text-slate-400">Location</p>
+                  <p className="text-xs font-black text-slate-800 truncate max-w-full">
+                    {profile?.country || 'Global'}
+                  </p>
                 </div>
               </div>
 

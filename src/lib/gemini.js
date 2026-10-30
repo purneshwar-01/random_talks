@@ -3,7 +3,15 @@
  */
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+const isGeminiAvailable = Boolean(
+  GEMINI_API_KEY &&
+  typeof GEMINI_API_KEY === 'string' &&
+  !GEMINI_API_KEY.startsWith('AQ.') &&
+  GEMINI_API_KEY.trim() !== ''
+);
+const GEMINI_URL = isGeminiAvailable
+  ? `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`
+  : '';
 
 export const FALLBACK_ICEBREAKERS = {
   professional: [
@@ -56,7 +64,7 @@ export async function generateIcebreaker(mode = 'casual', myInterests = [], othe
   const pool = FALLBACK_ICEBREAKERS[modeKey] || FALLBACK_ICEBREAKERS.casual;
   const fallback = pool[Math.floor(Math.random() * pool.length)];
 
-  if (!GEMINI_API_KEY) {
+  if (!isGeminiAvailable) {
     return fallback;
   }
 
@@ -96,7 +104,7 @@ Return ONLY the question text (max 20 words) with no quotes, greetings, or prefi
  * Generate 5 witty conversation rules and waiting tips for the matchmaking screen
  */
 export async function generateMatchmakingTips() {
-  if (!GEMINI_API_KEY) {
+  if (!isGeminiAvailable) {
     return FALLBACK_TIPS;
   }
 
